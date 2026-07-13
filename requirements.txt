@@ -1,0 +1,5 @@
+search1688api
+requests
+aiohttp
+beautifulsoup4
+lxml

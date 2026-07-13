@@ -1,0 +1,24 @@
+.DS_Store
+.env
+.env.*
+node_modules/
+__pycache__/
+*.py[cod]
+.venv*/
+venv/
+
+# Browser profiles, extension copies and authentication state
+playwright_profile/
+user-data/
+maozi-plugin*/
+
+# Runtime and business data
+flow_b_codex_transfer_20260608/runs/
+flow_b_codex_transfer_20260608/data/
+artifacts/
+output/
+outputs/
+tmp/
+*.log
+*.jsonl
+*.csv
