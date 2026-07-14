@@ -64,6 +64,48 @@ test("malformed bare price tokens invalidate the evidence", () => {
   assert.match(result.reason, /insufficient|invalid/i);
 });
 
+test("nonzero review decisions preserve the 1688 reliability reason", async () => {
+  await withTempDir(async (runDir) => {
+    let runs = 0;
+    const bridge = createCostBridge({
+      download: async (_url, destinationPath) => fs.writeFile(destinationPath, "image"),
+      runProcess: async () => {
+        runs += 1;
+        return {
+          code: 2,
+          stdout: [
+            "DECISION REVIEW",
+            "REASON extreme price spread without strong main cluster",
+            "COST_SOURCE search_first_page_p70_similarity_filtered",
+            "P70_COST None",
+          ].join("\n"),
+          stderr: "",
+        };
+      },
+    });
+
+    const result = await bridge.estimate({
+      sku: "review-1",
+      cover_image: "https://example.invalid/cover.jpg",
+      sell_price: 100,
+    }, runDir);
+
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "extreme price spread without strong main cluster");
+    assert.equal(result.process_code, 2);
+
+    const cached = await bridge.estimate({
+      sku: "review-2",
+      cover_image: "https://example.invalid/cover.jpg",
+      sell_price: 100,
+    }, runDir);
+    assert.equal(cached.ok, false);
+    assert.equal(cached.reason, result.reason);
+    assert.equal(cached.shared_cache, true);
+    assert.equal(runs, 1);
+  });
+});
+
 test("estimate reuses parseable cached output without redownloading or rerunning", async () => {
   await withTempDir(async (runDir) => {
     const imagesDir = path.join(runDir, "images");
@@ -206,5 +248,35 @@ test("estimate persists partial process evidence on timeout", async () => {
     assert.match(evidence, /PARTIAL STDOUT/);
     assert.match(evidence, /PARTIAL STDERR/);
     assert.match(evidence, /timed out/);
+  });
+});
+
+test("same cover image shares one in-flight 1688 query and persists reusable cache", async () => {
+  await withTempDir(async (runDir) => {
+    let runs = 0;
+    const bridge = createCostBridge({
+      download: async (_url, destinationPath) => fs.writeFile(destinationPath, "image"),
+      runProcess: async () => {
+        runs += 1;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return {
+          code: 0,
+          stdout: [
+            "COST_SOURCE search_first_page_p70_similarity_filtered",
+            "FILTERED_FIRST_PAGE_PRICES [10, 11, 12]",
+            "P70_COST 11",
+          ].join("\n"),
+          stderr: "",
+        };
+      },
+    });
+    const first = { sku: "same-1", cover_image: "https://img.example/same.jpg", sell_price: 100 };
+    const second = { sku: "same-2", cover_image: "https://img.example/same.jpg", sell_price: 100 };
+    const results = await Promise.all([bridge.estimate(first, runDir), bridge.estimate(second, runDir)]);
+    assert.equal(runs, 1);
+    assert.ok(results.every((row) => row.ok));
+    assert.ok(results.some((row) => row.shared_cache === true));
+    const cache = JSON.parse(await fs.readFile(path.join(runDir, "1688_cache.json"), "utf8"));
+    assert.equal(Object.keys(cache.entries).length, 1);
   });
 });

@@ -111,14 +111,17 @@ export function createMaoziClient({ transport }) {
       return data;
     },
 
-    async resolvePublishTarget({ storeNeedle, watermarkNeedle }) {
+    async resolvePublishTarget({ storeNeedle, watermarkNeedle, storeId, watermarkId }) {
       if (!String(storeNeedle || "").trim()) throw new Error("store needle is required");
       if (!String(watermarkNeedle || "").trim()) throw new Error("watermark needle is required");
       const [shops, watermarks] = await Promise.all([listShops(), listWatermarks()]);
-      return {
-        store: selectNamedResource(shops, storeNeedle, "store"),
-        watermark: selectNamedResource(watermarks, watermarkNeedle, "watermark"),
-      };
+      const namedStore = selectNamedResource(shops, storeNeedle, "store");
+      const namedWatermark = selectNamedResource(watermarks, watermarkNeedle, "watermark");
+      const store = storeId === undefined ? namedStore : shops.find((row) => String(row?.id) === String(storeId));
+      const watermark = watermarkId === undefined ? namedWatermark : watermarks.find((row) => String(row?.id) === String(watermarkId));
+      if (!store) throw new Error(`verified store ID not found: ${storeId}`);
+      if (!watermark) throw new Error(`verified watermark ID not found: ${watermarkId}`);
+      return { store, watermark };
     },
 
     async getCategoryBySku(sku) {
@@ -222,7 +225,13 @@ export function createMaoziPageTransport({ page, context, baseUrl = "https://api
     let lastError;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
-        return await evaluate(page, { ...request, headers: {} });
+        const result = await evaluate(page, { ...request, headers: {} });
+        const transientGet = request.method === "GET" && (
+          Number(result?.status) === 0
+          || /请求过于频繁|too many requests|rate.?limit|failed to fetch/i.test(String(result?.json?.msg || result?.json?.message || result?.json?.error || ""))
+        );
+        if (!transientGet || attempt >= 2) return result;
+        await new Promise((resolve) => setTimeout(resolve, 750 * (2 ** attempt)));
       } catch (error) {
         lastError = error;
         if (!context || !/target page|context or browser has been closed/i.test(String(error?.message || error))) throw error;

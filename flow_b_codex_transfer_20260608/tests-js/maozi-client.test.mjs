@@ -61,6 +61,23 @@ test("publish target rejects empty store or watermark needles", async () => {
   );
 });
 
+test("publish target pins the verified store and watermark IDs", async () => {
+  const transport = makeTransport({
+    "/api.shop/lists": { status: 200, json: { code: 1, data: [{ id: 1, name: "丽丽1号 old" }, { id: 104965, name: "丽丽1号" }] } },
+    "/api.watermark/templates": { status: 200, json: { code: 1, data: [{ id: 2, name: "lysh old" }, { id: 60822, name: "lysh" }] } },
+  });
+  const client = createMaoziClient({ transport });
+  assert.deepEqual(await client.resolvePublishTarget({
+    storeNeedle: "丽丽1号",
+    watermarkNeedle: "lysh",
+    storeId: 104965,
+    watermarkId: 60822,
+  }), {
+    store: { id: 104965, name: "丽丽1号" },
+    watermark: { id: 60822, name: "lysh" },
+  });
+});
+
 test("client validates endpoint request shapes for category and profit lookups", async () => {
   const transport = makeTransport({
     "/api.tool/get_category_by_sku": { status: 200, json: { code: 1, data: { cate: [1, 2, 3], product_info: { weight: 12 } } } },

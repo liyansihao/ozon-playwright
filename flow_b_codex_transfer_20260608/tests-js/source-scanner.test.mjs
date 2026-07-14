@@ -6,16 +6,47 @@ import {
   favoriteRetryDelay,
   favoriteModeSkipReason,
   effectiveFavoriteTotal,
+  expandHighYieldSourceUrls,
   isFavoriteSessionAuthenticated,
   isFavoriteCapacityReached,
   isOzonSoftBlock,
   isProvenSellerSource,
   ozonRetryDelay,
   prioritizeFavoriteLinks,
+  prioritizeSourceUrls,
   parseFavoriteProductSnapshot,
   requiresFavoriteSession,
   terminalSkusFromJsonl,
+  limitLinksPerSource,
 } from "../scripts/flow_b_playwright/source-scanner.mjs";
+
+test("source scan prioritizes proven sellers, Global China, and target families stably", () => {
+  const ordinary = "https://www.ozon.ru/seller/ordinary/";
+  const apparel = "https://www.ozon.ru/highlight/odezhda-obuv-i-aksessuary-iz-za-rubezha-1698511/";
+  const global = "https://www.ozon.ru/highlight/tovary-iz-kitaya-935133/";
+  const proven = "https://www.ozon.ru/seller/nuanniu/";
+  assert.deepEqual(prioritizeSourceUrls([ordinary, apparel, global, proven]), [proven, global, apparel, ordinary]);
+});
+
+test("published sources expand into prioritized sorting variants without duplicates", () => {
+  const successful = "https://www.ozon.ru/seller/example/?currency_price=50.000%3B";
+  const ordinary = "https://www.ozon.ru/seller/ordinary/";
+  const rows = [{ source_url: successful, status: "published" }];
+  const expanded = expandHighYieldSourceUrls([ordinary, successful], rows);
+  const prioritized = prioritizeSourceUrls(expanded, { highYieldSources: [successful] });
+  assert.equal(prioritized[0], successful);
+  assert.deepEqual(prioritized.slice(1, 4).map((value) => new URL(value).searchParams.get("sorting")), ["rating", "price", "discount"]);
+  assert.equal(new Set(prioritized).size, prioritized.length);
+  assert.equal(prioritized.at(-1), ordinary);
+});
+
+test("source fairness caps each large source before combining batches", () => {
+  const rows = [
+    { source_url: "a", links: Array.from({ length: 5 }, (_, index) => ({ href: `a-${index}`, text: "" })) },
+    { source_url: "b", links: Array.from({ length: 5 }, (_, index) => ({ href: `b-${index}`, text: "" })) },
+  ];
+  assert.deepEqual(limitLinksPerSource(rows, 2).map((row) => row.href), ["a-0", "a-1", "b-0", "b-1"]);
+});
 
 test("proven seller source recognition is explicit", () => {
   assert.equal(isProvenSellerSource("https://www.ozon.ru/seller/xiangyu01/?currency_price=150"), true);

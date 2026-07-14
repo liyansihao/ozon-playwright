@@ -307,3 +307,27 @@ test("runner ends a dry candidate tail at the configured limit", async () => {
   assert.equal(result.attempted, 2);
   assert.equal(result.dry_candidates, 2);
 });
+
+test("repeated consumer rounds reuse verified target and commission configuration", async () => {
+  const cache = {};
+  let targetCalls = 0;
+  let commissionCalls = 0;
+  const client = clientFor([], {
+    resolvePublishTarget: async () => {
+      targetCalls += 1;
+      return { store: { id: 104965, name: "丽丽1号" }, watermark: { id: 60822, name: "lysh" } };
+    },
+    listCategoryCommissions: async () => { commissionCalls += 1; return []; },
+  });
+  for (let round = 0; round < 2; round += 1) {
+    await createPublishRunner({
+      client,
+      costBridge: { estimate: async () => ({ ok: true, cost: 20 }) },
+      state: fakeState(),
+      target: 1,
+      targetConfigCache: cache,
+    }).run();
+  }
+  assert.equal(targetCalls, 1);
+  assert.equal(commissionCalls, 1);
+});

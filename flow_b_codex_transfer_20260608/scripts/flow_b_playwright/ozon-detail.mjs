@@ -1,4 +1,5 @@
 import { canonicalProductUrl } from "./publish-state.mjs";
+import { AdaptiveConcurrency } from "./continuous-runtime.mjs";
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -45,13 +46,57 @@ export function parseOzonDetailText(text, fallbackPrice, webPriceText = "") {
   };
 }
 
-export function createOzonDetailProvider({ context, timeout = 20000, pollInterval = 750 } = {}) {
+export function createOzonDetailProvider({
+  context,
+  timeout = 20000,
+  pollInterval = 750,
+  initialConcurrency = 8,
+  maxConcurrency = 12,
+} = {}) {
   if (!context || typeof context.newPage !== "function") throw new TypeError("Playwright context is required for Ozon detail extraction");
+  const adaptive = new AdaptiveConcurrency({ initial: initialConcurrency, max: maxConcurrency });
+  const available = [];
+  const waiters = [];
+  let created = 0;
+
+  async function acquirePage() {
+    if (available.length) return available.pop();
+    if (created < adaptive.current) {
+      created += 1;
+      try {
+        return await context.newPage();
+      } catch (error) {
+        created -= 1;
+        throw error;
+      }
+    }
+    return new Promise((resolve) => waiters.push(resolve));
+  }
+
+  async function releasePage(page, reusable = true) {
+    if (!reusable || (typeof page?.isClosed === "function" && page.isClosed())) {
+      created = Math.max(0, created - 1);
+      await page?.close?.().catch(() => {});
+      const next = waiters.shift();
+      if (next) {
+        created += 1;
+        context.newPage().then(next, () => { created = Math.max(0, created - 1); next(null); });
+      }
+      return;
+    }
+    const next = waiters.shift();
+    if (next) next(page);
+    else available.push(page);
+  }
+
   return {
+    adaptive,
     async getProductDetail(skuValue, item = {}) {
       const sku = String(skuValue || "").trim();
       if (!sku) throw new Error("Ozon detail SKU is required");
-      const page = await context.newPage();
+      const page = await acquirePage();
+      if (!page) throw new Error("Ozon detail page pool could not allocate a page");
+      let reusable = true;
       try {
         const url = item.link || item.detail_url || canonicalProductUrl(sku);
         await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
@@ -72,14 +117,24 @@ export function createOzonDetailProvider({ context, timeout = 20000, pollInterva
         } while (true);
         if (!payload?.text) throw new Error(`Ozon detail text unavailable for SKU ${sku}`);
         const fallback = item.sell_price ?? item.current_price ?? item.price;
-        return {
+        const result = {
           ...parseOzonDetailText(payload.text, fallback, payload.webPriceText),
           detail_url: payload.url,
           detail_title: payload.title,
         };
+        adaptive.recordSuccess();
+        return result;
+      } catch (error) {
+        adaptive.recordFailure(error);
+        reusable = !/target page|context or browser has been closed|frame was detached/i.test(String(error?.message || error));
+        throw error;
       } finally {
-        await page.close().catch(() => {});
+        await releasePage(page, reusable);
       }
+    },
+    async close() {
+      await Promise.all(available.splice(0).map((page) => page.close().catch(() => {})));
+      created = 0;
     },
   };
 }

@@ -5,6 +5,7 @@ import * as defaultPolicy from "./publish-policy.mjs";
 import { canonicalProductUrl } from "./publish-state.mjs";
 import { mapOzonCategory } from "./category-commission.mjs";
 import { productTitlePriority } from "./source-scanner.mjs";
+import { AdaptiveConcurrency, hasReusableCandidateFacts, loadCandidateFacts, mergeCandidateFacts } from "./continuous-runtime.mjs";
 
 const ECONOMY_SENTINEL = Object.freeze({
   title: "CEL Economy",
@@ -109,8 +110,13 @@ export function createPublishRunner({
   runDir = process.cwd(),
   storeNeedle = "丽丽1号",
   watermarkNeedle = "lysh",
+  storeId = 104965,
+  watermarkId = 60822,
   concurrency = 1,
+  maxConcurrency = 12,
   dryCandidateLimit = 0,
+  deadlineAt = null,
+  targetConfigCache = null,
 } = {}) {
   if (!client || !costBridge || !state) throw new TypeError("client, costBridge, and state are required");
   if (!detailProvider || typeof detailProvider.getProductDetail !== "function") {
@@ -126,6 +132,27 @@ export function createPublishRunner({
   if (!Number.isInteger(dryLimit) || dryLimit < 0) throw new TypeError("dryCandidateLimit must be a non-negative integer");
   let cnyRubRate = 10.4672;
   let publishChain = Promise.resolve();
+  let metricsChain = Promise.resolve();
+  const adaptive = new AdaptiveConcurrency({ initial: workerCount, max: Math.max(workerCount, Number(maxConcurrency) || workerCount) });
+
+  function recordMetric(filename, row) {
+    metricsChain = metricsChain.then(async () => {
+      await fs.mkdir(runDir, { recursive: true });
+      await fs.appendFile(path.join(runDir, filename), `${JSON.stringify({ at: now().toISOString(), ...row })}\n`);
+    });
+  }
+
+  async function timed(sku, stage, operation) {
+    const started = Date.now();
+    try {
+      const value = await operation();
+      recordMetric("stage_timings.jsonl", { sku, stage, duration_ms: Date.now() - started, ok: true });
+      return value;
+    } catch (error) {
+      recordMetric("stage_timings.jsonl", { sku, stage, duration_ms: Date.now() - started, ok: false, error: String(error?.message || error) });
+      throw error;
+    }
+  }
 
   function publishSerial(payload) {
     const operation = publishChain.then(() => client.publish(payload));
@@ -153,10 +180,18 @@ export function createPublishRunner({
     const sku = asSku(item);
     try {
       await state.transition(sku, "processing", { started_at: now().toISOString() });
-      const [detailResult, categoryData] = await Promise.all([
-        detailProvider.getProductDetail(sku, item),
+      const reusable = hasReusableCandidateFacts(item);
+      const [detailResult, categoryData] = await timed(sku, "ozon_detail_and_category", () => Promise.all([
+        reusable ? Promise.resolve({
+          mode: item.shipping_mode ?? item.mode,
+          title: item.title,
+          cover_image: item.cover_image,
+          current_price: item.sale_price ?? item.sell_price,
+          detail_url: item.link,
+          reused_collection_facts: true,
+        }) : detailProvider.getProductDetail(sku, item),
         client.getCategoryBySku(sku),
-      ]);
+      ]));
       const detail = { ...item, ...(detailResult || {}) };
 
       // Reuse the central policy for mode/category checks before paying the 1688 cost.
@@ -166,7 +201,7 @@ export function createPublishRunner({
       const salePrice = policy.selectSalePrice(detail);
       if (!(Number(salePrice) > 0)) return skip(item, "missing-sale-price");
 
-      const cost = await costBridge.estimate({ ...detail, sell_price: salePrice }, runDir);
+      const cost = await timed(sku, "1688_cost", () => costBridge.estimate({ ...detail, sell_price: salePrice }, runDir));
       if (!cost?.ok) return skip(item, cost?.reason || cost?.error?.code || "unreliable-1688-cost", { cost });
 
       const productInfo = categoryData?.product_info || {};
@@ -176,7 +211,7 @@ export function createPublishRunner({
         salePrice,
         cnyRubRate,
       );
-      const calc = await client.calculateProfit({
+      const calc = await timed(sku, "profit_calculation", () => client.calculateProfit({
         sku,
         sell_price: salePrice,
         purchase_price: cost.cost,
@@ -191,7 +226,7 @@ export function createPublishRunner({
         profit_value: profitThreshold,
         profit_type: "percentage",
         cate: category.mapped,
-      });
+      }));
       if (Number(calc?.cnyrub_rate) > 0) cnyRubRate = Number(calc.cnyrub_rate);
       const economy = economyResult(calc);
       const preflightReason = policy.preflightSkipReason({ ...detail, economy });
@@ -206,7 +241,7 @@ export function createPublishRunner({
       if (profitReason) return skip(item, profitReason, { profit });
 
       const payload = buildPayload(item, detail, economy, targetConfig, now);
-      const publishResult = await publishSerial(payload);
+      const publishResult = await timed(sku, "maozi_publish", () => publishSerial(payload));
       if (!publishResult?.ok) {
         await state.transition(sku, "failed", { reason: "publish-not-confirmed", publish_result: publishResult ?? null });
         return { status: "failed", sku, reason: "publish-not-confirmed" };
@@ -225,21 +260,29 @@ export function createPublishRunner({
         watermark_id: targetConfig.watermark.id,
         published_at: now().toISOString(),
       });
-      return { status: "published", sku, payload, publishResult };
+      return { status: "published", sku, source_url: item.source_url ?? null, payload, publishResult };
     } catch (error) {
       await state.transition(sku, "failed", { reason: "exception", error: String(error?.message || error) }).catch(() => {});
-      return { status: "failed", sku, reason: "exception", error };
+      return { status: "failed", sku, source_url: item.source_url ?? null, reason: "exception", error };
     }
   }
 
   async function run() {
     await state.load?.();
     state.summary?.(targetCount);
-    const targetConfig = {
-      ...await client.resolvePublishTarget({ storeNeedle, watermarkNeedle }),
-      commissionTree: typeof client.listCategoryCommissions === "function" ? await client.listCategoryCommissions() : [],
-    };
-    const candidates = prioritizePublishCandidates(await client.listFavorites(), await loadPreflightPureSkus(runDir));
+    let targetConfig = targetConfigCache?.value;
+    if (!targetConfig) {
+      targetConfig = {
+        ...await client.resolvePublishTarget({ storeNeedle, watermarkNeedle, storeId, watermarkId }),
+        commissionTree: typeof client.listCategoryCommissions === "function" ? await client.listCategoryCommissions() : [],
+      };
+      if (targetConfigCache) targetConfigCache.value = targetConfig;
+    }
+    const facts = await loadCandidateFacts(runDir);
+    const candidates = prioritizePublishCandidates(
+      (await client.listFavorites()).map((item) => mergeCandidateFacts(item, facts.get(String(item?.sku ?? item?.id ?? "")) || {})),
+      await loadPreflightPureSkus(runDir),
+    );
     let published = Number(state.runPublishedCount?.() ?? 0);
     let failed = 0;
     let skipped = 0;
@@ -279,13 +322,17 @@ export function createPublishRunner({
     let cursor = 0;
     while (cursor < candidates.length
       && published < targetCount
+      && (!deadlineAt || Date.now() < Date.parse(deadlineAt))
       && (dryLimit === 0 || dryCandidates < dryLimit)) {
-      const nearTarget = published >= targetCount - (workerCount - 1);
-      const width = nearTarget ? 1 : workerCount;
+      const nearTarget = published >= targetCount - (adaptive.current - 1);
+      const width = nearTarget ? 1 : adaptive.current;
       const batch = candidates.slice(cursor, cursor + width);
       cursor += batch.length;
       const results = await Promise.all(batch.map(handleCandidate));
       for (const result of results) {
+        recordMetric("source_yield.jsonl", { sku: result.sku, source_url: result.source_url ?? null, status: result.status, reason: result.reason ?? null });
+        if (result.status === "failed" && result.error) adaptive.recordFailure(result.error);
+        else adaptive.recordSuccess();
         if (result.attempted) attempted += 1;
         if (result.status === "published") {
           published += 1;
@@ -298,12 +345,16 @@ export function createPublishRunner({
       }
     }
 
+    await metricsChain;
+
     return {
       published,
       failed,
       skipped,
       attempted,
       dry_candidates: dryCandidates,
+      final_concurrency: adaptive.current,
+      deadline_reached: Boolean(deadlineAt && Date.now() >= Date.parse(deadlineAt)),
       target: targetCount,
       state_summary: state.summary?.(targetCount),
     };

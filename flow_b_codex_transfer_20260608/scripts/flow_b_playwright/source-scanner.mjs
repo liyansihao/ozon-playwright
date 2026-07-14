@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { ensureMaoziLogin, openMaoziPage } from "./browser-context.mjs";
+import { AdaptiveConcurrency } from "./continuous-runtime.mjs";
 import { isPureFbs } from "./publish-policy.mjs";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -88,11 +89,73 @@ export function isProvenSellerSource(value) {
   return /\/seller\/(?:nuanniu|miaowu|yishao|alisa-3673390|vash-vybor-3332584|xiangyu01|kshunby|xzx-a02|fabrika-ulichnogo-stilya|linkworld-2709304|dretd)(?:[/?]|$)/i.test(String(value || ""));
 }
 
+function sourceUrlPriority(value) {
+  const raw = String(value || "");
+  let decoded = raw;
+  try { decoded = decodeURIComponent(raw); } catch {}
+  const proven = isProvenSellerSource(raw) ? 1000 : 0;
+  const global = /(?:ozon-global|tovary-iz-kitaya|tovary-so-vsego-mira|is_global=true)/i.test(decoded) ? 500 : 0;
+  const targetFamily = /(?:детск|detsk|ребен|odezhd|aksess|accessor|одежд|обув|трус|кепк|панам|носк|заколк|брелок|ремешок|бижутер)/i.test(decoded) ? 250 : 0;
+  return proven + global + targetFamily;
+}
+
+function sourceUrlKey(value) {
+  try {
+    const url = new URL(String(value));
+    url.searchParams.delete("sorting");
+    return url.toString();
+  } catch {
+    return String(value || "").replace(/([?&])sorting=[^&]*&?/i, "$1").replace(/[?&]$/, "");
+  }
+}
+
+export function expandHighYieldSourceUrls(urls, yieldRows = []) {
+  const expanded = [...urls];
+  const seen = new Set(expanded);
+  const successful = [...new Set(yieldRows
+    .filter((row) => row?.status === "published" && /^https?:\/\//i.test(String(row?.source_url || "")))
+    .map((row) => String(row.source_url)))];
+  for (const source of successful) {
+    for (const sorting of ["rating", "price", "discount"]) {
+      try {
+        const url = new URL(source);
+        url.searchParams.set("sorting", sorting);
+        const value = url.toString();
+        if (!seen.has(value)) {
+          seen.add(value);
+          expanded.push(value);
+        }
+      } catch {}
+    }
+  }
+  return expanded;
+}
+
+export function prioritizeSourceUrls(urls, { highYieldSources = [] } = {}) {
+  const successfulKeys = new Set(highYieldSources.map(sourceUrlKey));
+  return [...urls]
+    .map((url, index) => ({
+      url,
+      index,
+      priority: sourceUrlPriority(url) + (successfulKeys.has(sourceUrlKey(url)) ? 2000 : 0),
+    }))
+    .sort((left, right) => right.priority - left.priority || left.index - right.index)
+    .map(({ url }) => url);
+}
+
 export function prioritizeFavoriteLinks(links) {
   return [...links]
     .map((link, index) => ({ link, index, priority: favoriteLinkPriority(link) }))
     .sort((left, right) => right.priority - left.priority || left.index - right.index)
     .map(({ link }) => link);
+}
+
+export function limitLinksPerSource(rows, limit = 24) {
+  const maximum = Math.max(1, Number(limit) || 24);
+  return rows.flatMap((row) => prioritizeFavoriteLinks((row?.links || []).map((link) => ({
+    ...link,
+    source_url: row.source_url,
+  }))).slice(0, maximum));
 }
 
 export function terminalSkusFromJsonl(text) {
@@ -218,7 +281,7 @@ async function favoriteProduct(page, productInfo) {
 }
 
 async function extractFavoriteProduct(page, url, timeout) {
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: Math.max(10_000, Math.min(30_000, timeout * 2)) });
   const deadline = Date.now() + timeout;
   let snapshot;
   do {
@@ -255,7 +318,7 @@ async function collectFavorites({ context, maozi, links, target, currentTotal, e
     const sku = skuFromProductUrl(href);
     if (!sku || existing.has(sku) || attempted.has(sku)) continue;
     attempted.add(sku);
-    queue.push({ sku, href });
+    queue.push({ sku, href, source_url: typeof link === "object" ? link?.source_url : null });
   }
   const workerCount = Math.max(1, envNumber(env, "FLOW_B_FAVORITE_WORKERS", envNumber(env, "FLOW_B_TAB_WORKERS", 4)));
   const timeout = envNumber(env, "FLOW_B_FAVORITE_DETAIL_TIMEOUT", 15000);
@@ -332,7 +395,19 @@ async function collectFavorites({ context, maozi, links, target, currentTotal, e
           existing.add(productInfo.sku);
           total += 1;
           const observedTotal = total;
-          await record({ status: "favorited", preflight_mode: "FBS", sku: productInfo.sku, url: item.href, total: observedTotal });
+          await record({
+            status: "favorited",
+            preflight_mode: "FBS",
+            shipping_mode: "FBS",
+            sku: productInfo.sku,
+            url: item.href,
+            source_url_product: item.href,
+            source_url: item.source_url || null,
+            sale_price: productInfo.price_info?.sell_price ?? null,
+            title: productInfo.title,
+            cover_image: productInfo.coverImage,
+            total: observedTotal,
+          });
           log(`favorite SKU ${productInfo.sku} total=${observedTotal}/${target}`);
         } catch (error) {
           if (isFavoriteCapacityReached(error)) {
@@ -422,15 +497,30 @@ async function scanOne(page, url, { steps, ratio, delay, initialWait, maxNoNewSt
 export async function scanSources({ context, urlsFile, outFile, env = process.env, log = console.log }) {
   const inputPath = path.resolve(urlsFile);
   const outputPath = path.resolve(outFile);
-  const urls = [...new Set((await fs.readFile(inputPath, "utf8")).split(/\r?\n/).map((value) => value.trim()).filter(Boolean))];
+  const inputUrls = [...new Set((await fs.readFile(inputPath, "utf8")).split(/\r?\n/).map((value) => value.trim()).filter(Boolean))];
+  let yieldRows = [];
+  try {
+    const text = await fs.readFile(path.join(path.dirname(outputPath), "source_yield.jsonl"), "utf8");
+    yieldRows = text.split(/\r?\n/).flatMap((line) => {
+      try { return [JSON.parse(line)]; } catch { return []; }
+    });
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  const urls = [...new Set(expandHighYieldSourceUrls(inputUrls, yieldRows))];
   let records = [];
   try {
     const parsed = JSON.parse(await fs.readFile(outputPath, "utf8"));
     if (Array.isArray(parsed)) records = parsed;
   } catch {}
   const done = new Set(records.map((row) => row.source_url).filter(Boolean));
-  const pending = urls.filter((url) => !done.has(url));
+  const highYieldSources = yieldRows.filter((row) => row?.status === "published").map((row) => row.source_url);
+  const pending = prioritizeSourceUrls(urls.filter((url) => !done.has(url)), { highYieldSources });
   const workers = Math.max(1, envNumber(env, "FLOW_B_TAB_WORKERS", 4));
+  const adaptiveWorkers = new AdaptiveConcurrency({
+    initial: workers,
+    max: Math.max(workers, envNumber(env, "FLOW_B_MAX_TAB_WORKERS", 12)),
+  });
   const options = {
     steps: envNumber(env, "FLOW_B_MAX_SCROLL_STEPS", 24),
     ratio: envNumber(env, "FLOW_B_SCROLL_RATIO", 0.82),
@@ -445,7 +535,7 @@ export async function scanSources({ context, urlsFile, outFile, env = process.en
   const attempted = await loadExcludedSkus(outputPath, env);
   log(`favorite exclusions loaded: ${attempted.size}`);
   const favoriteLog = path.join(path.dirname(outputPath), "favorite_collection.jsonl");
-  const maozi = await openMaoziPage(context);
+  const maozi = await openMaoziPage(context, { forceNew: true });
   try {
     await waitForContent(maozi, 15000);
     if (requiresFavoriteSession(env)) {
@@ -461,9 +551,7 @@ export async function scanSources({ context, urlsFile, outFile, env = process.en
         : env.FLOW_B_RETAINED_PROVEN_ONLY === "1"
           ? records.filter((row) => isProvenSellerSource(row.source_url))
           : records;
-      const retainedLinks = retainedRows.flatMap((row) => Array.isArray(row.links)
-        ? row.links.map((link) => ({ ...link, source_url: row.source_url }))
-        : []);
+      const retainedLinks = limitLinksPerSource(retainedRows, envNumber(env, "FLOW_B_MAX_LINKS_PER_SOURCE", 24));
       log(`collecting favorites from ${retainedLinks.length} retained product links`);
       favoriteBefore = await collectFavorites({
         context,
@@ -478,20 +566,28 @@ export async function scanSources({ context, urlsFile, outFile, env = process.en
       });
     }
 
-    for (let start = 0; start < pending.length; start += workers) {
+    for (let start = 0; start < pending.length;) {
       if (favoriteBefore !== null && favoriteBefore >= targetFavorites) break;
-      const batch = pending.slice(start, start + workers);
-      log(`batch ${start + 1}-${start + batch.length} / ${pending.length}`);
+      const batch = pending.slice(start, start + adaptiveWorkers.current);
+      start += batch.length;
+      const batchFavoriteBefore = favoriteBefore;
+      log(`batch ${start - batch.length + 1}-${start} / ${pending.length} concurrency=${adaptiveWorkers.current}`);
       const pages = await Promise.all(batch.map(() => context.newPage()));
       const batchRows = await Promise.all(pages.map((page, index) => scanOne(page, batch[index], options)
         .catch((error) => ({ source_url: batch[index], blocked: false, stop_reason: `error: ${error.message}`, links: [], cumulative_product_link_count: 0 }))));
       await Promise.all(pages.map((page) => page.close().catch(() => {})));
+      for (const row of batchRows) {
+        if (row.blocked || /soft block|access denied|captcha|timeout|error:/i.test(String(row.stop_reason || ""))) {
+          adaptiveWorkers.recordFailure(new Error(row.stop_reason || "soft block"));
+        } else {
+          adaptiveWorkers.recordSuccess();
+        }
+      }
       if (favoriteBefore !== null) {
         favoriteBefore = await collectFavorites({
           context,
           maozi,
-          links: batchRows.flatMap((row, index) => (row.links || [])
-            .map((link) => ({ ...link, source_url: batch[index] }))),
+          links: limitLinksPerSource(batchRows.map((row, index) => ({ ...row, source_url: batch[index] })), envNumber(env, "FLOW_B_MAX_LINKS_PER_SOURCE", 24)),
           target: targetFavorites,
           currentTotal: favoriteBefore,
           env,
@@ -509,17 +605,17 @@ export async function scanSources({ context, urlsFile, outFile, env = process.en
         observedTotal: observedFavoriteAfter,
         target: targetFavorites,
       });
-      const delta = favoriteBefore !== null && favoriteAfter !== null ? favoriteAfter - favoriteBefore : null;
+      const delta = batchFavoriteBefore !== null && favoriteAfter !== null ? favoriteAfter - batchFavoriteBefore : null;
       records.push(...batchRows.map((row, index) => ({
         source_url: batch[index],
         ...row,
-        favorite_count_before: favoriteBefore,
+        favorite_count_before: batchFavoriteBefore,
         favorite_count_after: favoriteAfter,
         favorite_count_delta: delta,
       })));
       await fs.mkdir(path.dirname(outputPath), { recursive: true });
       await fs.writeFile(outputPath, JSON.stringify(records, null, 2));
-      log(`favorite ${favoriteBefore} -> ${favoriteAfter} delta=${delta}`);
+      log(`favorite ${batchFavoriteBefore} -> ${favoriteAfter} delta=${delta}`);
       favoriteBefore = favoriteAfter;
       if (favoriteAfter !== null && favoriteAfter >= targetFavorites) break;
       if (lowDeltaBatchLimit > 0) {

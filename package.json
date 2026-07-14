@@ -9,6 +9,7 @@
     "flow:b:scan": "node flow_b_codex_transfer_20260608/scripts/flow_b_playwright.mjs scan",
     "flow:b:publish": "node flow_b_codex_transfer_20260608/scripts/flow_b_playwright.mjs publish",
     "flow:b:run": "node flow_b_codex_transfer_20260608/scripts/flow_b_playwright.mjs run",
+    "flow:b:accept": "node flow_b_codex_transfer_20260608/scripts/flow_b_playwright.mjs accept",
     "test:flow-b": "node --test flow_b_codex_transfer_20260608/tests-js/*.test.mjs",
     "test:python": "python3 -m unittest discover -s flow_b_codex_transfer_20260608/tests -p 'test_*.py'",
     "test": "npm run test:flow-b && npm run test:python"
