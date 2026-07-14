@@ -5,6 +5,15 @@ import { AdaptiveConcurrency } from "./continuous-runtime.mjs";
 import { isPureFbs } from "./publish-policy.mjs";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const DEFAULT_SOURCE_YIELD_HISTORY = path.resolve(import.meta.dirname, "../../data/flow_b/source_yield_history.jsonl");
+
+export async function waitForMovingDeadline({ getDeadline, now = () => Date.now(), sleep: wait = sleep }) {
+  while (true) {
+    const remaining = Number(getDeadline()) - Number(now());
+    if (!(remaining > 0)) return;
+    await wait(remaining);
+  }
+}
 
 function envNumber(env, name, fallback) {
   const value = Number(env[name]);
@@ -51,6 +60,24 @@ export function favoriteRetryDelay(error, attempt) {
   return null;
 }
 
+export async function retryMaoziPageFetch(operation, {
+  attempts = 5,
+  sleep: wait = sleep,
+} = {}) {
+  let lastError;
+  for (let attempt = 0; attempt < Math.max(1, Number(attempts) || 1); attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      const delay = favoriteRetryDelay(error, attempt);
+      if (delay === null || attempt + 1 >= attempts) throw error;
+      await wait(delay);
+    }
+  }
+  throw lastError;
+}
+
 export function isFavoriteCapacityReached(error) {
   return /收藏数量已达上限|favorite.*(?:limit|capacity)/i.test(String(error?.message || error || ""));
 }
@@ -70,6 +97,15 @@ export function isOzonSoftBlock(value) {
 
 export function ozonRetryDelay(attempt) {
   return Math.min(180_000, 60_000 * (2 ** Math.max(0, attempt)));
+}
+
+export function ozonDetailFailurePolicy(error, attempt, retries) {
+  const softBlocked = /Ozon detail soft blocked/i.test(String(error?.message || error || ""));
+  return {
+    softBlocked,
+    retry: softBlocked && Number(attempt) < Number(retries),
+    delay: softBlocked ? ozonRetryDelay(attempt) : 0,
+  };
 }
 
 export function productTitlePriority(value) {
@@ -103,9 +139,12 @@ function sourceUrlKey(value) {
   try {
     const url = new URL(String(value));
     url.searchParams.delete("sorting");
+    url.searchParams.delete("currency_price");
     return url.toString();
   } catch {
-    return String(value || "").replace(/([?&])sorting=[^&]*&?/i, "$1").replace(/[?&]$/, "");
+    return String(value || "")
+      .replace(/([?&])(?:sorting|currency_price)=[^&]*&?/gi, "$1")
+      .replace(/[?&]$/, "");
   }
 }
 
@@ -116,16 +155,21 @@ export function expandHighYieldSourceUrls(urls, yieldRows = []) {
     .filter((row) => row?.status === "published" && /^https?:\/\//i.test(String(row?.source_url || "")))
     .map((row) => String(row.source_url)))];
   for (const source of successful) {
-    for (const sorting of ["rating", "price", "discount"]) {
-      try {
+    let parsed;
+    try { parsed = new URL(source); } catch { continue; }
+    const existingBand = parsed.searchParams.get("currency_price");
+    const bands = [...new Set([existingBand, "50.000;", "120.000;", "150.000;", "500.000;"].filter(Boolean))];
+    for (const band of bands) {
+      for (const sorting of [null, "rating", "price", "discount"]) {
         const url = new URL(source);
-        url.searchParams.set("sorting", sorting);
+        url.searchParams.set("currency_price", band);
+        if (sorting) url.searchParams.set("sorting", sorting);
+        else url.searchParams.delete("sorting");
         const value = url.toString();
-        if (!seen.has(value)) {
-          seen.add(value);
-          expanded.push(value);
-        }
-      } catch {}
+        if (seen.has(value)) continue;
+        seen.add(value);
+        expanded.push(value);
+      }
     }
   }
   return expanded;
@@ -141,6 +185,45 @@ export function prioritizeSourceUrls(urls, { highYieldSources = [] } = {}) {
     }))
     .sort((left, right) => right.priority - left.priority || left.index - right.index)
     .map(({ url }) => url);
+}
+
+export function retainedRowsForCollection(records, {
+  skipRetained = false,
+  provenOnly = false,
+  highYieldSources = [],
+} = {}) {
+  const successfulKeys = new Set(highYieldSources.map(sourceUrlKey));
+  return (records || []).filter((row) => {
+    if (provenOnly && !isProvenSellerSource(row?.source_url)) return false;
+    if (skipRetained && !successfulKeys.has(sourceUrlKey(row?.source_url))) return false;
+    return true;
+  });
+}
+
+export function orderRowsBySourceYield(rows, yieldRows = []) {
+  const stats = new Map();
+  for (const row of yieldRows) {
+    const key = sourceUrlKey(row?.source_url);
+    if (!key || row?.status === "ignored") continue;
+    const value = stats.get(key) || { attempted: 0, published: 0 };
+    value.attempted += 1;
+    if (row?.status === "published") value.published += 1;
+    stats.set(key, value);
+  }
+  return [...(rows || [])].map((row, index) => {
+    const value = stats.get(sourceUrlKey(row?.source_url)) || { attempted: 0, published: 0 };
+    return {
+      row,
+      index,
+      published: value.published,
+      score: (value.published + 0.5) / (value.attempted + 2),
+    };
+  }).sort((left, right) => right.score - left.score || right.published - left.published || left.index - right.index)
+    .map(({ row }) => row);
+}
+
+export function shouldYieldAfterRetained({ retainedLinks, pendingSources }) {
+  return Number(retainedLinks) > 0 && Number(pendingSources) > 0;
 }
 
 export function prioritizeFavoriteLinks(links) {
@@ -170,24 +253,45 @@ export function terminalSkusFromJsonl(text) {
   return new Set([...latest].filter(([, status]) => status === "skipped" || status === "published").map(([sku]) => sku));
 }
 
-async function loadExcludedSkus(outputPath, env) {
+export function excludedSkusFromHistories({ stateTexts = [], favoriteTexts = [] } = {}) {
   const excluded = new Set();
-  try {
-    const stateText = await fs.readFile(path.join(path.dirname(outputPath), "sku_states.jsonl"), "utf8");
-    for (const sku of terminalSkusFromJsonl(stateText)) excluded.add(sku);
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
+  for (const text of stateTexts) {
+    for (const sku of terminalSkusFromJsonl(text)) excluded.add(sku);
   }
-  try {
-    const favoriteText = await fs.readFile(path.join(path.dirname(outputPath), "favorite_collection.jsonl"), "utf8");
-    for (const line of favoriteText.split(/\r?\n/)) {
+  for (const text of favoriteTexts) {
+    for (const line of String(text || "").split(/\r?\n/)) {
       try {
         const event = JSON.parse(line);
         if (event?.status === "rejected" && event?.sku) excluded.add(String(event.sku));
       } catch {}
     }
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
+  }
+  return excluded;
+}
+
+async function loadExcludedSkus(outputPath, env) {
+  const stateFiles = [
+    path.join(path.dirname(outputPath), "sku_states.jsonl"),
+    ...String(env.FLOW_B_STATE_SEED_FILES || "").split(path.delimiter).filter(Boolean),
+  ];
+  const favoriteFiles = [
+    path.join(path.dirname(outputPath), "favorite_collection.jsonl"),
+    ...String(env.FLOW_B_FAVORITE_SEED_FILES || "").split(path.delimiter).filter(Boolean),
+  ];
+  const readHistories = async (filenames) => {
+    const texts = [];
+    for (const filename of [...new Set(filenames.map((value) => path.resolve(value)))]) {
+      try { texts.push(await fs.readFile(filename, "utf8")); }
+      catch (error) { if (error.code !== "ENOENT") throw error; }
+    }
+    return texts;
+  };
+  const excluded = excludedSkusFromHistories({
+    stateTexts: await readHistories(stateFiles),
+    favoriteTexts: await readHistories(favoriteFiles),
+  });
+  if (env.FLOW_B_EXCLUDED_SKUS) {
+    for (const sku of String(env.FLOW_B_EXCLUDED_SKUS).split(/[,\s]+/).filter(Boolean)) excluded.add(sku);
   }
   const publishedCsv = path.resolve(env.FLOW_B_PUBLISHED_CSV || path.join(import.meta.dirname, "../../data/flow_b/published_links.csv"));
   try {
@@ -230,7 +334,7 @@ export function parseFavoriteProductSnapshot({ url, title, ogTitle, ogImage, pri
 }
 
 async function favoriteCount(page) {
-  const result = await page.evaluate(async () => {
+  const result = await retryMaoziPageFetch(() => page.evaluate(async () => {
     let token = "";
     try { token = JSON.parse(localStorage.getItem("maozierp-core-access") || "{}").accessToken || ""; } catch {}
     const headers = { "Accept-Language": "zh-CN", Client: "pc" };
@@ -244,12 +348,12 @@ async function favoriteCount(page) {
       code: body?.code,
       pageText: (document.body?.innerText || "").slice(0, 1000),
     };
-  });
+  }));
   return { total: result.total, authenticated: isFavoriteSessionAuthenticated(result) };
 }
 
 async function favoriteSkus(page) {
-  return page.evaluate(async () => {
+  return retryMaoziPageFetch(() => page.evaluate(async () => {
     let token = "";
     try { token = JSON.parse(localStorage.getItem("maozierp-core-access") || "{}").accessToken || ""; } catch {}
     const headers = { "Accept-Language": "zh-CN", Client: "pc" };
@@ -260,7 +364,7 @@ async function favoriteSkus(page) {
       throw new Error(body?.msg || "Unable to load Maozi favorite SKUs");
     }
     return body.data.map(String);
-  });
+  }));
 }
 
 async function favoriteProduct(page, productInfo) {
@@ -309,9 +413,15 @@ async function extractFavoriteProduct(page, url, timeout) {
   return parseFavoriteProductSnapshot(snapshot || { url });
 }
 
-async function collectFavorites({ context, maozi, links, target, currentTotal, env, attempted, logFile, log }) {
+async function collectFavorites({ context, maozi, links, target, currentTotal, env, attempted, logFile, log, onResult = () => {} }) {
   if (currentTotal >= target || !links.length) return currentTotal;
-  const existing = new Set(await favoriteSkus(maozi));
+  let existing = new Set();
+  try {
+    existing = new Set(await favoriteSkus(maozi));
+  } catch (error) {
+    onResult({ status: "failed", error });
+    log(`favorite SKU telemetry unavailable; continuing with run-local deduplication: ${error?.message || error}`);
+  }
   const queue = [];
   for (const link of prioritizeFavoriteLinks(links)) {
     const href = typeof link === "string" ? link : link?.href;
@@ -329,6 +439,7 @@ async function collectFavorites({ context, maozi, links, target, currentTotal, e
   let apiChain = Promise.resolve();
   let nextDetailAt = 0;
   let detailBlockedUntil = 0;
+  let detailSoftBlockStreak = 0;
   let detailGate = Promise.resolve();
   const apiInterval = Math.max(0, envNumber(env, "FLOW_B_FAVORITE_API_INTERVAL_MS", 750));
   const maxRetries = Math.max(0, envNumber(env, "FLOW_B_FAVORITE_API_RETRIES", 5));
@@ -336,8 +447,7 @@ async function collectFavorites({ context, maozi, links, target, currentTotal, e
   const detailRetries = Math.max(0, envNumber(env, "FLOW_B_FAVORITE_DETAIL_RETRIES", 3));
   const reserveDetailSlot = () => {
     const operation = detailGate.then(async () => {
-      const wait = Math.max(0, Math.max(nextDetailAt, detailBlockedUntil) - Date.now());
-      if (wait) await sleep(wait);
+      await waitForMovingDeadline({ getDeadline: () => Math.max(nextDetailAt, detailBlockedUntil) });
       nextDetailAt = Date.now() + detailInterval;
     });
     detailGate = operation.catch(() => {});
@@ -347,12 +457,17 @@ async function collectFavorites({ context, maozi, links, target, currentTotal, e
     for (let attempt = 0; ; attempt += 1) {
       await reserveDetailSlot();
       try {
-        return await extractFavoriteProduct(page, item.href, timeout);
+        const result = await extractFavoriteProduct(page, item.href, timeout);
+        detailSoftBlockStreak = 0;
+        return result;
       } catch (error) {
-        if (!/Ozon detail soft blocked/i.test(String(error?.message || error)) || attempt >= detailRetries) throw error;
-        const retryDelay = ozonRetryDelay(attempt);
-        detailBlockedUntil = Math.max(detailBlockedUntil, Date.now() + retryDelay);
-        log(`Ozon detail retry SKU ${item.sku} attempt=${attempt + 1} wait=${retryDelay}ms`);
+        const policy = ozonDetailFailurePolicy(error, attempt, detailRetries);
+        if (!policy.softBlocked) throw error;
+        const cooldown = ozonRetryDelay(detailSoftBlockStreak);
+        detailSoftBlockStreak += 1;
+        detailBlockedUntil = Math.max(detailBlockedUntil, Date.now() + cooldown);
+        if (!policy.retry) throw error;
+        log(`Ozon detail retry SKU ${item.sku} attempt=${attempt + 1} wait=${cooldown}ms`);
       }
     }
   };
@@ -408,17 +523,21 @@ async function collectFavorites({ context, maozi, links, target, currentTotal, e
             cover_image: productInfo.coverImage,
             total: observedTotal,
           });
+          onResult({ status: "favorited", sku: productInfo.sku });
           log(`favorite SKU ${productInfo.sku} total=${observedTotal}/${target}`);
         } catch (error) {
           if (isFavoriteCapacityReached(error)) {
             total = target;
             await record({ status: "capacity_reached", sku: item.sku, url: item.href, message: String(error?.message || error) });
+            onResult({ status: "capacity_reached", sku: item.sku });
             log(`favorite capacity reached; ending collection at configured target ${target}`);
           } else if (/^non-pure-fbs:/i.test(String(error?.message || error))) {
             await record({ status: "rejected", reason: "non-pure-fbs", sku: item.sku, url: item.href });
+            onResult({ status: "rejected", reason: "non-pure-fbs", sku: item.sku });
             log(`favorite rejected SKU ${item.sku}: non-pure-fbs`);
           } else {
             await record({ status: "failed", sku: item.sku, url: item.href, error: String(error?.message || error) });
+            onResult({ status: "failed", sku: item.sku, error });
             log(`favorite failed SKU ${item.sku}: ${error?.message || error}`);
           }
         } finally {
@@ -498,14 +617,21 @@ export async function scanSources({ context, urlsFile, outFile, env = process.en
   const inputPath = path.resolve(urlsFile);
   const outputPath = path.resolve(outFile);
   const inputUrls = [...new Set((await fs.readFile(inputPath, "utf8")).split(/\r?\n/).map((value) => value.trim()).filter(Boolean))];
-  let yieldRows = [];
-  try {
-    const text = await fs.readFile(path.join(path.dirname(outputPath), "source_yield.jsonl"), "utf8");
-    yieldRows = text.split(/\r?\n/).flatMap((line) => {
-      try { return [JSON.parse(line)]; } catch { return []; }
-    });
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
+  const yieldFiles = [...new Set([
+    path.join(path.dirname(outputPath), "source_yield.jsonl"),
+    env.FLOW_B_SOURCE_YIELD_HISTORY || DEFAULT_SOURCE_YIELD_HISTORY,
+    ...String(env.FLOW_B_SOURCE_YIELD_SEED_FILES || "").split(path.delimiter).filter(Boolean),
+  ].map((value) => path.resolve(value)))];
+  const yieldRows = [];
+  for (const yieldFile of yieldFiles) {
+    try {
+      const text = await fs.readFile(yieldFile, "utf8");
+      yieldRows.push(...text.split(/\r?\n/).flatMap((line) => {
+        try { return [JSON.parse(line)]; } catch { return []; }
+      }));
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
   }
   const urls = [...new Set(expandHighYieldSourceUrls(inputUrls, yieldRows))];
   let records = [];
@@ -516,6 +642,7 @@ export async function scanSources({ context, urlsFile, outFile, env = process.en
   const done = new Set(records.map((row) => row.source_url).filter(Boolean));
   const highYieldSources = yieldRows.filter((row) => row?.status === "published").map((row) => row.source_url);
   const pending = prioritizeSourceUrls(urls.filter((url) => !done.has(url)), { highYieldSources });
+  if (!pending.length) return { outFile: outputPath, records: records.length, pending: 0 };
   const workers = Math.max(1, envNumber(env, "FLOW_B_TAB_WORKERS", 4));
   const adaptiveWorkers = new AdaptiveConcurrency({
     initial: workers,
@@ -541,17 +668,37 @@ export async function scanSources({ context, urlsFile, outFile, env = process.en
     if (requiresFavoriteSession(env)) {
       await ensureMaoziLogin(maozi, { continueDeviceLogin: env.FLOW_B_MAOZI_CONTINUE_LOGIN === "1" });
     }
-    let favoriteState = await favoriteCount(maozi);
+    let favoriteState;
+    try {
+      favoriteState = await favoriteCount(maozi);
+    } catch (error) {
+      log(`favorite count telemetry unavailable at scan start; relying on authenticated token and capacity response: ${error?.message || error}`);
+      favoriteState = { total: 0, authenticated: true };
+    }
     if (requiresFavoriteSession(env) && !favoriteState.authenticated) throw new Error("Maozi profile token is stale or the session is not logged in");
     let favoriteBefore = favoriteState.authenticated ? favoriteState.total : null;
 
     if (favoriteBefore !== null && favoriteBefore < targetFavorites && records.length) {
-      const retainedRows = env.FLOW_B_SKIP_RETAINED === "1"
-        ? []
-        : env.FLOW_B_RETAINED_PROVEN_ONLY === "1"
-          ? records.filter((row) => isProvenSellerSource(row.source_url))
-          : records;
-      const retainedLinks = limitLinksPerSource(retainedRows, envNumber(env, "FLOW_B_MAX_LINKS_PER_SOURCE", 24));
+      const baseLinkLimit = envNumber(env, "FLOW_B_MAX_LINKS_PER_SOURCE", 24);
+      const retainedRows = orderRowsBySourceYield(retainedRowsForCollection(records, {
+        skipRetained: env.FLOW_B_SKIP_RETAINED === "1",
+        provenOnly: env.FLOW_B_RETAINED_PROVEN_ONLY === "1",
+        highYieldSources,
+      }), yieldRows);
+      const retainedCandidates = limitLinksPerSource(
+        retainedRows,
+        envNumber(env, "FLOW_B_RETAINED_LINKS_PER_SOURCE", baseLinkLimit * 4),
+      );
+      const retainedLinks = [];
+      const retainedSkus = new Set();
+      const retainedLimit = Math.max(1, envNumber(env, "FLOW_B_MAX_RETAINED_LINKS", 60));
+      for (const link of retainedCandidates) {
+        const sku = skuFromProductUrl(link?.href);
+        if (!sku || attempted.has(sku) || retainedSkus.has(sku)) continue;
+        retainedSkus.add(sku);
+        retainedLinks.push(link);
+        if (retainedLinks.length >= retainedLimit) break;
+      }
       log(`collecting favorites from ${retainedLinks.length} retained product links`);
       favoriteBefore = await collectFavorites({
         context,
@@ -564,6 +711,14 @@ export async function scanSources({ context, urlsFile, outFile, env = process.en
         logFile: favoriteLog,
         log,
       });
+      if (shouldYieldAfterRetained({ retainedLinks: retainedLinks.length, pendingSources: pending.length })) {
+        return {
+          outFile: outputPath,
+          records: records.length,
+          pending: pending.length,
+          retained_attempted: retainedLinks.length,
+        };
+      }
     }
 
     for (let start = 0; start < pending.length;) {
@@ -584,6 +739,7 @@ export async function scanSources({ context, urlsFile, outFile, env = process.en
         }
       }
       if (favoriteBefore !== null) {
+        let collectionSoftBlocked = false;
         favoriteBefore = await collectFavorites({
           context,
           maozi,
@@ -594,12 +750,23 @@ export async function scanSources({ context, urlsFile, outFile, env = process.en
           attempted,
           logFile: favoriteLog,
           log,
+          onResult: (result) => {
+            if (result.status === "failed" && /soft blocked|access denied|captcha|timeout|failed to fetch|network|HTTP 0/i.test(String(result.error?.message || result.error || ""))) {
+              collectionSoftBlocked = true;
+            }
+          },
         });
+        if (collectionSoftBlocked) adaptiveWorkers.recordFailure(new Error("Ozon collection soft blocked"));
       }
       const afterWait = envNumber(env, "FLOW_B_MAOZI_AFTER_SCAN_WAIT", 10) * 1000;
       if (afterWait) await sleep(afterWait);
-      favoriteState = await favoriteCount(maozi);
-      const observedFavoriteAfter = favoriteState.authenticated ? favoriteState.total : null;
+      let observedFavoriteAfter = favoriteBefore;
+      try {
+        favoriteState = await favoriteCount(maozi);
+        observedFavoriteAfter = favoriteState.authenticated ? favoriteState.total : null;
+      } catch (error) {
+        log(`favorite count telemetry unavailable; retaining claimed total ${favoriteBefore}: ${error?.message || error}`);
+      }
       const favoriteAfter = observedFavoriteAfter === null ? null : effectiveFavoriteTotal({
         claimedTotal: favoriteBefore,
         observedTotal: observedFavoriteAfter,

@@ -176,7 +176,13 @@ export function createMaoziClient({ transport }) {
   };
 }
 
-export function createMaoziPageTransport({ page, context, baseUrl = "https://api.maozierp.com" }) {
+export function createMaoziPageTransport({
+  page,
+  context,
+  baseUrl = "https://api.maozierp.com",
+  maxGetAttempts = 6,
+  retrySleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+}) {
   if (!page || typeof page.evaluate !== "function") throw new TypeError("A Playwright Maozi page is required");
   const evaluate = (activePage, request) => activePage.evaluate(async (input) => {
     let token = "";
@@ -223,15 +229,16 @@ export function createMaoziPageTransport({ page, context, baseUrl = "https://api
       headers: {},
     };
     let lastError;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    const attempts = request.method === "GET" ? Math.max(1, Number(maxGetAttempts) || 1) : 1;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
       try {
         const result = await evaluate(page, { ...request, headers: {} });
         const transientGet = request.method === "GET" && (
           Number(result?.status) === 0
           || /请求过于频繁|too many requests|rate.?limit|failed to fetch/i.test(String(result?.json?.msg || result?.json?.message || result?.json?.error || ""))
         );
-        if (!transientGet || attempt >= 2) return result;
-        await new Promise((resolve) => setTimeout(resolve, 750 * (2 ** attempt)));
+        if (!transientGet || attempt + 1 >= attempts) return result;
+        await retrySleep(Math.min(5_000, 750 * (2 ** attempt)));
       } catch (error) {
         lastError = error;
         if (!context || !/target page|context or browser has been closed/i.test(String(error?.message || error))) throw error;

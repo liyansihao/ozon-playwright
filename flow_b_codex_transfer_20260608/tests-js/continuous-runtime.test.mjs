@@ -6,7 +6,9 @@ import {
   acceptanceSummary,
   operationalErrorSummary,
   mergeCandidateFacts,
+  isFatalBrowserError,
   rankSourcesByYield,
+  runProducerLoop,
 } from "../scripts/flow_b_playwright/continuous-runtime.mjs";
 
 test("collection facts retain publish-critical fields and override incomplete favorite rows", () => {
@@ -57,8 +59,10 @@ test("adaptive concurrency starts at 8, ramps to 12, and backs off on rate limit
   assert.equal(adaptive.current, 12);
   adaptive.recordFailure(new Error("HTTP 429 too many requests"));
   assert.equal(adaptive.current, 6);
+  adaptive.recordFailure(new Error("TypeError: Failed to fetch"));
+  assert.equal(adaptive.current, 3);
   adaptive.recordFailure(new Error("ordinary product mismatch"));
-  assert.equal(adaptive.current, 6);
+  assert.equal(adaptive.current, 3);
 });
 
 test("source yield ranks China/high-yield segments ahead of unproven sources", () => {
@@ -85,4 +89,31 @@ test("acceptance only counts unique in-window profit>30 publications and exclude
   assert.equal(summary.effective_per_hour, 0.5);
   assert.equal(summary.passed, true);
   assert.deepEqual(summary.skus, ["ok-1"]);
+});
+
+test("producer loop keeps rescanning after success and survives one failed scan", async () => {
+  let now = 0;
+  let calls = 0;
+  const errors = [];
+  const result = await runProducerLoop({
+    deadlineMs: 350,
+    intervalMs: 100,
+    now: () => now,
+    sleep: async (ms) => { now += ms; },
+    scan: async () => {
+      calls += 1;
+      if (calls === 2) throw new Error("transient producer failure");
+      return { round: calls };
+    },
+    onError: async (error) => { errors.push(error.message); },
+  });
+  assert.equal(calls, 4);
+  assert.deepEqual(errors, ["transient producer failure"]);
+  assert.deepEqual(result, { round: 4 });
+});
+
+test("closed Playwright contexts are fatal while individual page timeouts are recoverable", () => {
+  assert.equal(isFatalBrowserError(new Error("Target page, context or browser has been closed")), true);
+  assert.equal(isFatalBrowserError(new Error("browserContext.newPage: Target page has been closed")), true);
+  assert.equal(isFatalBrowserError(new Error("page.goto: Timeout 12000ms exceeded")), false);
 });

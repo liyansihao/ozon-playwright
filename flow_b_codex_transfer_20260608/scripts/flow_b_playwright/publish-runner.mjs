@@ -117,6 +117,7 @@ export function createPublishRunner({
   dryCandidateLimit = 0,
   deadlineAt = null,
   targetConfigCache = null,
+  sourceYieldHistoryPath = null,
 } = {}) {
   if (!client || !costBridge || !state) throw new TypeError("client, costBridge, and state are required");
   if (!detailProvider || typeof detailProvider.getProductDetail !== "function") {
@@ -137,8 +138,13 @@ export function createPublishRunner({
 
   function recordMetric(filename, row) {
     metricsChain = metricsChain.then(async () => {
+      const event = { at: now().toISOString(), ...row };
       await fs.mkdir(runDir, { recursive: true });
-      await fs.appendFile(path.join(runDir, filename), `${JSON.stringify({ at: now().toISOString(), ...row })}\n`);
+      await fs.appendFile(path.join(runDir, filename), `${JSON.stringify(event)}\n`);
+      if (filename === "source_yield.jsonl" && sourceYieldHistoryPath && event.source_url && event.status !== "ignored") {
+        await fs.mkdir(path.dirname(sourceYieldHistoryPath), { recursive: true });
+        await fs.appendFile(sourceYieldHistoryPath, `${JSON.stringify(event)}\n`);
+      }
     });
   }
 
@@ -170,10 +176,10 @@ export function createPublishRunner({
         skip_reason: reason,
         error: String(error?.message || error),
       });
-      return { status: "failed", sku, reason: "favorite-delete-failed" };
+      return { status: "failed", sku, source_url: item.source_url ?? null, reason: "favorite-delete-failed" };
     }
     await state.transition(sku, "skipped", { reason, favorite_deleted: true, ...data });
-    return { status: "skipped", sku, reason };
+    return { status: "skipped", sku, source_url: item.source_url ?? null, reason };
   }
 
   async function processItem(item, targetConfig) {
@@ -244,7 +250,7 @@ export function createPublishRunner({
       const publishResult = await timed(sku, "maozi_publish", () => publishSerial(payload));
       if (!publishResult?.ok) {
         await state.transition(sku, "failed", { reason: "publish-not-confirmed", publish_result: publishResult ?? null });
-        return { status: "failed", sku, reason: "publish-not-confirmed" };
+        return { status: "failed", sku, source_url: item.source_url ?? null, reason: "publish-not-confirmed" };
       }
 
       await state.recordPublished({
@@ -308,7 +314,7 @@ export function createPublishRunner({
           const existing = await client.findPublishedSku(sku);
           if (existing) {
             await state.recordPublished({ ...item, ...existing, sku, reconciled: true, reconciled_at: now().toISOString() });
-            return { status: "published", sku, reconciled: true };
+            return { status: "published", sku, source_url: item.source_url ?? null, reconciled: true };
           }
         } catch (error) {
           await state.transition(sku, "failed", { reason: "reconciliation-check-failed", error: String(error?.message || error) }).catch(() => {});

@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 import { createPublishRunner, prioritizePublishCandidates } from "../scripts/flow_b_playwright/publish-runner.mjs";
 
@@ -330,4 +333,29 @@ test("repeated consumer rounds reuse verified target and commission configuratio
   }
   assert.equal(targetCalls, 1);
   assert.equal(commissionCalls, 1);
+});
+
+test("source outcomes persist to the cross-run yield history", async () => {
+  const runDir = await fs.mkdtemp(path.join(os.tmpdir(), "flow-b-yield-run-"));
+  const historyDir = await fs.mkdtemp(path.join(os.tmpdir(), "flow-b-yield-history-"));
+  const historyPath = path.join(historyDir, "source_yield_history.jsonl");
+  try {
+    const sourceUrl = "https://www.ozon.ru/seller/proven/?currency_price=50.000%3B";
+    const runner = createPublishRunner({
+      client: clientFor([{ id: 50, sku: 50, source_url: sourceUrl }]),
+      costBridge: { estimate: async () => ({ ok: true, cost: 20 }) },
+      state: fakeState(),
+      target: 1,
+      runDir,
+      sourceYieldHistoryPath: historyPath,
+    });
+    await runner.run();
+    const rows = (await fs.readFile(historyPath, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].status, "published");
+    assert.equal(rows[0].source_url, sourceUrl);
+  } finally {
+    await fs.rm(runDir, { recursive: true, force: true });
+    await fs.rm(historyDir, { recursive: true, force: true });
+  }
 });

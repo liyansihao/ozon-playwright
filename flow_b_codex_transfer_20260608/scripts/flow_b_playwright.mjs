@@ -13,7 +13,7 @@ import { createPublishRunner } from "./flow_b_playwright/publish-runner.mjs";
 import { createPublishState } from "./flow_b_playwright/publish-state.mjs";
 import { scanSources } from "./flow_b_playwright/source-scanner.mjs";
 import { runReadOnlyVerification } from "./flow_b_playwright/verification.mjs";
-import { acceptanceSummary, operationalErrorSummary, rankSourcesByYield } from "./flow_b_playwright/continuous-runtime.mjs";
+import { acceptanceSummary, isFatalBrowserError, operationalErrorSummary, rankSourcesByYield, runProducerLoop } from "./flow_b_playwright/continuous-runtime.mjs";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const DEFAULT_RUN_DIR = path.join(ROOT, "runs/flow_b/playwright_target100");
@@ -76,11 +76,15 @@ async function createRunDir(runDir, sourceConfig) {
   if (sourceConfig) await fs.writeFile(path.join(runDir, "source_config.json"), `${JSON.stringify(sourceConfig, null, 2)}\n`);
 }
 
-async function publishWithContext(context, options, env, shared = {}) {
-  await createRunDir(options.runDir);
+async function closePublishingSession(session) {
+  if (!session) return;
+  await session.detailProvider?.close?.().catch(() => {});
+  await session.costBridge?.close?.().catch(() => {});
+  await session.maoziPage?.close?.().catch(() => {});
+}
+
+async function createPublishingSession(context, options, env, shared) {
   const maoziPage = await openMaoziPage(context, { forceNew: true });
-  let costBridge;
-  let detailProvider;
   try {
     await ensureMaoziLogin(maoziPage, { continueDeviceLogin: env.FLOW_B_MAOZI_CONTINUE_LOGIN === "1" });
     const client = createMaoziClient({ transport: createMaoziPageTransport({ page: maoziPage, context }) });
@@ -88,11 +92,11 @@ async function publishWithContext(context, options, env, shared = {}) {
       runDir: options.runDir,
       publishedCsv: path.join(ROOT, "data/flow_b/published_links.csv"),
     });
-    costBridge = createCostBridge({
+    const costBridge = createCostBridge({
       python: env.FLOW_B_PYTHON || "python3",
       scriptPath: env.FLOW_B_1688_SCRIPT || path.join(ROOT, "scripts/1688_image_median.py"),
     });
-    detailProvider = createOzonDetailProvider({
+    const detailProvider = createOzonDetailProvider({
       context,
       timeout: Math.max(1000, Number(env.FLOW_B_OZON_DETAIL_TIMEOUT_MS) || 10000),
       initialConcurrency: Math.max(1, Number(env.FLOW_B_PUBLISH_WORKERS) || 8),
@@ -115,12 +119,28 @@ async function publishWithContext(context, options, env, shared = {}) {
       dryCandidateLimit: Math.max(0, Number(env.FLOW_B_MAX_DRY_CANDIDATES) || 0),
       deadlineAt: env.FLOW_B_DEADLINE_AT || null,
       targetConfigCache: shared.targetConfigCache || null,
+      sourceYieldHistoryPath: env.FLOW_B_SOURCE_YIELD_HISTORY || path.join(ROOT, "data/flow_b/source_yield_history.jsonl"),
     });
-    return await runner.run();
-  } finally {
-    await detailProvider?.close?.().catch(() => {});
-    await costBridge?.close?.().catch(() => {});
+    return { maoziPage, costBridge, detailProvider, runner };
+  } catch (error) {
     await maoziPage.close().catch(() => {});
+    throw error;
+  }
+}
+
+async function publishWithContext(context, options, env, shared = {}) {
+  await createRunDir(options.runDir);
+  const persistent = shared.persistent === true;
+  const session = shared.session || await createPublishingSession(context, options, env, shared);
+  if (persistent) shared.session = session;
+  try {
+    return await session.runner.run();
+  } catch (error) {
+    if (persistent) shared.session = null;
+    await closePublishingSession(session);
+    throw error;
+  } finally {
+    if (!persistent) await closePublishingSession(session);
   }
 }
 
@@ -292,32 +312,39 @@ async function runAcceptance(context, options, env) {
     max_concurrency: Number(env.FLOW_B_MAX_PUBLISH_WORKERS || 12),
   });
   await fs.writeFile(windowPath, `${JSON.stringify({ started_at: startedAt.toISOString(), ended_at: endedAt.toISOString() }, null, 2)}\n`);
-  const shared = { targetConfigCache: {} };
-  const scanTask = (async () => {
-    let lastResult = null;
-    while (Date.now() < endedAt.getTime()) {
-      try {
-        lastResult = await scanSources({ context, urlsFile: options.urlsFile, outFile: options.outFile, env: runtimeEnv });
-        return lastResult;
-      } catch (error) {
-        await fs.appendFile(path.join(options.runDir, "runtime_errors.jsonl"), `${JSON.stringify({ at: new Date().toISOString(), stage: "producer", error: String(error?.message || error) })}\n`);
-        const wait = Math.min(15_000, endedAt.getTime() - Date.now());
-        if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+  const shared = { targetConfigCache: {}, persistent: true, session: null };
+  let producerFatalError = null;
+  const scanTask = runProducerLoop({
+    deadlineMs: endedAt.getTime(),
+    intervalMs: Math.max(1_000, Number(env.FLOW_B_PRODUCER_INTERVAL_MS || 20_000)),
+    shouldStop: () => Boolean(producerFatalError),
+    scan: () => scanSources({ context, urlsFile: options.urlsFile, outFile: options.outFile, env: runtimeEnv }),
+    onError: async (error) => {
+      await fs.appendFile(path.join(options.runDir, "runtime_errors.jsonl"), `${JSON.stringify({ at: new Date().toISOString(), stage: "producer", error: String(error?.message || error) })}\n`);
+      if (isFatalBrowserError(error)) {
+        producerFatalError = error;
       }
-    }
-    return lastResult || { deadline_reached: true };
-  })();
+    },
+  });
   const rounds = [];
   while (Date.now() < endedAt.getTime()) {
+    if (producerFatalError) throw producerFatalError;
     try {
       rounds.push(await publishWithContext(context, options, runtimeEnv, shared));
     } catch (error) {
       await fs.appendFile(path.join(options.runDir, "runtime_errors.jsonl"), `${JSON.stringify({ at: new Date().toISOString(), stage: "consumer", error: String(error?.message || error) })}\n`);
+      if (isFatalBrowserError(error)) {
+        producerFatalError = error;
+        break;
+      }
     }
     const wait = Math.min(Math.max(1_000, Number(env.FLOW_B_POLL_INTERVAL_MS || 10_000)), endedAt.getTime() - Date.now());
     if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
   }
   const scan = await scanTask;
+  await closePublishingSession(shared.session);
+  shared.session = null;
+  if (producerFatalError) throw producerFatalError;
   const report = await writeAcceptanceReport(options.runDir, startedAt.toISOString(), endedAt.toISOString(), acceptanceTarget);
   return { report, scan, rounds };
 }

@@ -77,7 +77,7 @@ export class AdaptiveConcurrency {
   }
 
   recordFailure(error) {
-    if (/429|too many requests|rate.?limit|soft block|access denied|captcha|timeout/i.test(String(error?.message || error || ""))) {
+    if (/429|too many requests|rate.?limit|soft block|access denied|captcha|timeout|failed to fetch|network|HTTP 0/i.test(String(error?.message || error || ""))) {
       this.current = Math.max(this.min, Math.floor(this.current / 2));
       this.stable = 0;
     }
@@ -131,4 +131,35 @@ export function operationalErrorSummary({ successCount = 0, skippedCount = 0, fa
     sku_error_rate: roundRate(Math.max(0, Number(failedCount)), skuAttempts),
     runtime_error_count: runtimeErrors,
   };
+}
+
+export async function runProducerLoop({
+  scan,
+  deadlineMs,
+  intervalMs = 10_000,
+  now = () => Date.now(),
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  onError = async () => {},
+  shouldStop = () => false,
+} = {}) {
+  if (typeof scan !== "function") throw new TypeError("scan is required");
+  const deadline = Number(deadlineMs);
+  if (!Number.isFinite(deadline)) throw new TypeError("deadlineMs must be finite");
+  let lastResult = null;
+  while (now() < deadline && !shouldStop()) {
+    try {
+      lastResult = await scan();
+    } catch (error) {
+      await onError(error);
+    }
+    if (shouldStop()) break;
+    const wait = Math.min(Math.max(1, Number(intervalMs) || 1), deadline - now());
+    if (wait > 0) await sleep(wait);
+  }
+  return lastResult || { deadline_reached: true };
+}
+
+export function isFatalBrowserError(error) {
+  return /target (?:page, )?context or browser has been closed|browsercontext\.(?:newpage|close).*target page has been closed|browser has been closed/i
+    .test(String(error?.message || error || ""));
 }

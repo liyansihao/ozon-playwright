@@ -250,3 +250,24 @@ test("browser transport retries on the replacement Maozi page after SSO closes",
   const transport = createMaoziPageTransport({ page: first, context });
   assert.deepEqual(await transport("/api.shop/lists"), { status: 200, json: { code: 1 } });
 });
+
+test("browser transport retries GET requests through a short HTTP 0 outage", async () => {
+  let calls = 0;
+  const delays = [];
+  const page = {
+    evaluate: async () => {
+      calls += 1;
+      return calls < 5
+        ? { status: 0, json: { error: "Failed to fetch" } }
+        : { status: 200, json: { code: 1, data: [] } };
+    },
+  };
+  const transport = createMaoziPageTransport({
+    page,
+    maxGetAttempts: 6,
+    retrySleep: async (ms) => delays.push(ms),
+  });
+  assert.deepEqual(await transport("/api.shop/lists"), { status: 200, json: { code: 1, data: [] } });
+  assert.equal(calls, 5);
+  assert.deepEqual(delays, [750, 1_500, 3_000, 5_000]);
+});
