@@ -44,7 +44,7 @@ test("visible Ozon price overrides ruble sales revenue stored as favorite fallba
   assert.equal(detail.selected_price, 8.76);
 });
 
-test("Playwright detail provider closes its page and returns parsed facts", async () => {
+test("Playwright detail provider reuses its page until the pool closes", async () => {
   let closed = false;
   const page = {
     goto: async () => {},
@@ -60,6 +60,8 @@ test("Playwright detail provider closes its page and returns parsed facts", asyn
   assert.equal(detail.mode, "FBS");
   assert.equal(detail.follow_min, 80);
   assert.equal(detail.detail_url, "https://www.ozon.ru/product/test-123/");
+  assert.equal(closed, false);
+  await provider.close();
   assert.equal(closed, true);
 });
 

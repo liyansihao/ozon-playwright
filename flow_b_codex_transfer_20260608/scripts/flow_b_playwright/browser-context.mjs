@@ -98,11 +98,11 @@ export async function launchFlowContext(options) {
   }
 }
 
-export async function openMaoziPage(context, { settleMs = 1000 } = {}) {
+export async function openMaoziPage(context, { settleMs = 1000, forceNew = false } = {}) {
   const available = () => context.pages().filter((page) => typeof page.isClosed !== "function" || !page.isClosed());
-  let page = available().find((candidate) => targetUrl(candidate).startsWith("https://ozon.maozierp.com/"));
+  let page = forceNew ? null : available().find((candidate) => targetUrl(candidate).startsWith("https://ozon.maozierp.com/"));
   if (!page) {
-    page = available()[0] || await context.newPage();
+    page = forceNew ? await context.newPage() : available()[0] || await context.newPage();
     await page.goto("https://ozon.maozierp.com/#/product/favorite", { waitUntil: "domcontentloaded", timeout: 60000 });
   }
   if (settleMs > 0) await delay(settleMs);
@@ -132,6 +132,9 @@ export async function ensureMaoziLogin(page, { continueDeviceLogin = false, time
   } catch (error) {
     if (!continueDeviceLogin) throw error;
     const button = page.getByRole("button", { name: "继续登录", exact: true });
+    if (typeof button.waitFor === "function") {
+      await button.waitFor({ state: "visible", timeout }).catch(() => {});
+    }
     if (await button.count() !== 1) throw error;
     await button.click();
     await page.waitForFunction(() => {

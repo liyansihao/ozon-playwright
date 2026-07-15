@@ -12,8 +12,10 @@ export function selectNamedResource(rows, needle, label) {
   return found;
 }
 
-export function selectSalePrice({ current_price, follow_min }) {
-  const values = [current_price, follow_min].map(Number).filter((value) => value > 0);
+export function selectSalePrice({ current_price, follow_min, selected_price, sale_price, sell_price }) {
+  const primary = [current_price, follow_min].map(Number).filter((value) => value > 0);
+  if (primary.length) return Math.min(...primary);
+  const values = [selected_price, sale_price, sell_price].map(Number).filter((value) => value > 0);
   return values.length ? Math.min(...values) : null;
 }
 

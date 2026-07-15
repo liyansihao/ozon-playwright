@@ -9,6 +9,9 @@ const ENDPOINTS = Object.freeze({
   profit: "/api.tool/calc_profit",
   publish: "/api.selection.follow/import",
   commissions: "/api.config/get_ozon_cate_commission",
+  importLogs: "/api.product.import_logs/index",
+  onlineProducts: "/api.product.online/lists",
+  batchUpdateStock: "/api.product.online/batch_update_stock",
 });
 
 function successResponse(response) {
@@ -111,14 +114,17 @@ export function createMaoziClient({ transport }) {
       return data;
     },
 
-    async resolvePublishTarget({ storeNeedle, watermarkNeedle }) {
+    async resolvePublishTarget({ storeNeedle, watermarkNeedle, storeId, watermarkId }) {
       if (!String(storeNeedle || "").trim()) throw new Error("store needle is required");
       if (!String(watermarkNeedle || "").trim()) throw new Error("watermark needle is required");
       const [shops, watermarks] = await Promise.all([listShops(), listWatermarks()]);
-      return {
-        store: selectNamedResource(shops, storeNeedle, "store"),
-        watermark: selectNamedResource(watermarks, watermarkNeedle, "watermark"),
-      };
+      const namedStore = selectNamedResource(shops, storeNeedle, "store");
+      const namedWatermark = selectNamedResource(watermarks, watermarkNeedle, "watermark");
+      const store = storeId === undefined ? namedStore : shops.find((row) => String(row?.id) === String(storeId));
+      const watermark = watermarkId === undefined ? namedWatermark : watermarks.find((row) => String(row?.id) === String(watermarkId));
+      if (!store) throw new Error(`verified store ID not found: ${storeId}`);
+      if (!watermark) throw new Error(`verified watermark ID not found: ${watermarkId}`);
+      return { store, watermark };
     },
 
     async getCategoryBySku(sku) {
@@ -142,6 +148,47 @@ export function createMaoziClient({ transport }) {
         status: response?.status ?? 0,
         response: response?.json ?? null,
       };
+    },
+
+    async findImportLog({ shopId, sku, offerId } = {}) {
+      const response = await transport(ENDPOINTS.importLogs, {
+        method: "GET",
+        query: { page: 1, page_size: 10, shop_id: shopId, sku: String(sku ?? "") },
+      });
+      const data = requireSuccess(response, "import logs lookup");
+      const rows = listRows(data, "import logs lookup");
+      return rows.find((row) => String(row?.sku) === String(sku)
+        && (!offerId || String(row?.offer_id) === String(offerId))) || null;
+    },
+
+    async findOnlineProduct({ shopId, offerId } = {}) {
+      const response = await transport(ENDPOINTS.onlineProducts, {
+        method: "GET",
+        query: { page: 1, page_size: 10, shop_id: shopId, offer_id: String(offerId ?? "") },
+      });
+      const data = requireSuccess(response, "online product lookup");
+      const rows = listRows(data, "online product lookup");
+      return rows.find((row) => String(row?.offer_id) === String(offerId)) || null;
+    },
+
+    async updateProductStock({ shopId, product, warehouseId, stock = 1 } = {}) {
+      const productId = Number(product?.id);
+      const normalizedWarehouseId = Number(warehouseId);
+      const normalizedStock = Number(stock);
+      if (!(productId > 0)) throw new Error("online product record ID is required for stock update");
+      if (!(normalizedWarehouseId > 0)) throw new Error("verified warehouse ID is required for stock update");
+      if (!Number.isInteger(normalizedStock) || normalizedStock < 0) throw new Error("stock must be a non-negative integer");
+      return requireSuccess(await transport(ENDPOINTS.batchUpdateStock, {
+        method: "POST",
+        body: {
+          shop_id: Number(shopId),
+          products: [{
+            id: productId,
+            offer_id: String(product?.offer_id || ""),
+            warehouses: [{ warehouse_id: normalizedWarehouseId, stock: normalizedStock }],
+          }],
+        },
+      }), "stock update");
     },
 
     async deleteFavorite(item) {
@@ -173,7 +220,13 @@ export function createMaoziClient({ transport }) {
   };
 }
 
-export function createMaoziPageTransport({ page, context, baseUrl = "https://api.maozierp.com" }) {
+export function createMaoziPageTransport({
+  page,
+  context,
+  baseUrl = "https://api.maozierp.com",
+  maxGetAttempts = 6,
+  retrySleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+}) {
   if (!page || typeof page.evaluate !== "function") throw new TypeError("A Playwright Maozi page is required");
   const evaluate = (activePage, request) => activePage.evaluate(async (input) => {
     let token = "";
@@ -220,9 +273,16 @@ export function createMaoziPageTransport({ page, context, baseUrl = "https://api
       headers: {},
     };
     let lastError;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    const attempts = request.method === "GET" ? Math.max(1, Number(maxGetAttempts) || 1) : 1;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
       try {
-        return await evaluate(page, { ...request, headers: {} });
+        const result = await evaluate(page, { ...request, headers: {} });
+        const transientGet = request.method === "GET" && (
+          Number(result?.status) === 0
+          || /请求过于频繁|too many requests|rate.?limit|failed to fetch/i.test(String(result?.json?.msg || result?.json?.message || result?.json?.error || ""))
+        );
+        if (!transientGet || attempt + 1 >= attempts) return result;
+        await retrySleep(Math.min(5_000, 750 * (2 ** attempt)));
       } catch (error) {
         lastError = error;
         if (!context || !/target page|context or browser has been closed/i.test(String(error?.message || error))) throw error;

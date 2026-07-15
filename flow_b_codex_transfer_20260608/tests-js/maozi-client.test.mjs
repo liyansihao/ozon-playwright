@@ -61,6 +61,23 @@ test("publish target rejects empty store or watermark needles", async () => {
   );
 });
 
+test("publish target pins the verified store and watermark IDs", async () => {
+  const transport = makeTransport({
+    "/api.shop/lists": { status: 200, json: { code: 1, data: [{ id: 1, name: "丽丽1号 old" }, { id: 104965, name: "丽丽1号" }] } },
+    "/api.watermark/templates": { status: 200, json: { code: 1, data: [{ id: 2, name: "lysh old" }, { id: 60822, name: "lysh" }] } },
+  });
+  const client = createMaoziClient({ transport });
+  assert.deepEqual(await client.resolvePublishTarget({
+    storeNeedle: "丽丽1号",
+    watermarkNeedle: "lysh",
+    storeId: 104965,
+    watermarkId: 60822,
+  }), {
+    store: { id: 104965, name: "丽丽1号" },
+    watermark: { id: 60822, name: "lysh" },
+  });
+});
+
 test("client validates endpoint request shapes for category and profit lookups", async () => {
   const transport = makeTransport({
     "/api.tool/get_category_by_sku": { status: 200, json: { code: 1, data: { cate: [1, 2, 3], product_info: { weight: 12 } } } },
@@ -114,6 +131,29 @@ test("client validates endpoint request shapes for category and profit lookups",
   );
 });
 
+test("client updates one imported product in the verified FBS warehouse", async () => {
+  const transport = makeTransport({
+    "/api.product.online/batch_update_stock": {
+      status: 200,
+      json: { code: 1, data: { updated_count: 1, result: [{ updated: true, errors: [] }] } },
+    },
+  });
+  const client = createMaoziClient({ transport });
+  assert.deepEqual(await client.updateProductStock({
+    shopId: 104965,
+    product: { id: 1270954452, offer_id: "mz-140726-091839" },
+    warehouseId: 1020005022957960,
+    stock: 1,
+  }), { updated_count: 1, result: [{ updated: true, errors: [] }] });
+  assert.deepEqual(transport.calls, [[
+    "/api.product.online/batch_update_stock",
+    { method: "POST", body: {
+      shop_id: 104965,
+      products: [{ id: 1270954452, offer_id: "mz-140726-091839", warehouses: [{ warehouse_id: 1020005022957960, stock: 1 }] }],
+    } },
+  ]]);
+});
+
 test("client only treats explicit Maozi publish success as success", async () => {
   const ok = createMaoziClient({ transport: async () => ({ status: 200, json: { code: 1, msg: "success" } }) });
   const badCode = createMaoziClient({ transport: async () => ({ status: 200, json: { code: 0, msg: "failed" } }) });
@@ -122,6 +162,44 @@ test("client only treats explicit Maozi publish success as success", async () =>
   assert.equal((await ok.publish({ rows: [] })).ok, true);
   assert.equal((await badCode.publish({ rows: [] })).ok, false);
   assert.equal((await badShape.publish({ rows: [] })).ok, false);
+});
+
+test("client verifies the final ERP import log and exact online offer", async () => {
+  const transport = makeTransport({
+    "/api.product.import_logs/index": (path, request) => {
+      assert.deepEqual(request.query, { page: 1, page_size: 10, shop_id: 104965, sku: "3301105092" });
+      return { status: 200, json: { code: 1, data: { data: [
+        { sku: 3301105092, offer_id: "mz-140726-105092", import_status: "all_imported" },
+      ] } } };
+    },
+    "/api.product.online/lists": (path, request) => {
+      assert.deepEqual(request.query, { page: 1, page_size: 10, shop_id: 104965, offer_id: "mz-140726-105092" });
+      return { status: 200, json: { code: 1, data: { data: [
+        { sku: 5069587484, offer_id: "mz-140726-105092", online_status: "ready_to_sell", stock: 0 },
+      ] } } };
+    },
+  });
+  const client = createMaoziClient({ transport });
+  assert.deepEqual(await client.findImportLog({ shopId: 104965, sku: "3301105092" }), {
+    sku: 3301105092, offer_id: "mz-140726-105092", import_status: "all_imported",
+  });
+  assert.deepEqual(await client.findOnlineProduct({ shopId: 104965, offerId: "mz-140726-105092" }), {
+    sku: 5069587484, offer_id: "mz-140726-105092", online_status: "ready_to_sell", stock: 0,
+  });
+});
+
+test("client preserves final import failure evidence", async () => {
+  const failure = {
+    sku: 3761127274,
+    offer_id: "mz-140726-127274",
+    import_status: "all_failed",
+    skus: [{ error_msg: "Не получится загрузить товары: вы исчерпали суточный лимит" }],
+  };
+  const client = createMaoziClient({ transport: async () => ({
+    status: 200,
+    json: { code: 1, data: { data: [failure] } },
+  }) });
+  assert.deepEqual(await client.findImportLog({ shopId: 104965, sku: "3761127274" }), failure);
 });
 
 test("client deletes a favorite through the plugin toggle contract", async () => {
@@ -232,4 +310,25 @@ test("browser transport retries on the replacement Maozi page after SSO closes",
   const context = { pages: () => [first, second] };
   const transport = createMaoziPageTransport({ page: first, context });
   assert.deepEqual(await transport("/api.shop/lists"), { status: 200, json: { code: 1 } });
+});
+
+test("browser transport retries GET requests through a short HTTP 0 outage", async () => {
+  let calls = 0;
+  const delays = [];
+  const page = {
+    evaluate: async () => {
+      calls += 1;
+      return calls < 5
+        ? { status: 0, json: { error: "Failed to fetch" } }
+        : { status: 200, json: { code: 1, data: [] } };
+    },
+  };
+  const transport = createMaoziPageTransport({
+    page,
+    maxGetAttempts: 6,
+    retrySleep: async (ms) => delays.push(ms),
+  });
+  assert.deepEqual(await transport("/api.shop/lists"), { status: 200, json: { code: 1, data: [] } });
+  assert.equal(calls, 5);
+  assert.deepEqual(delays, [750, 1_500, 3_000, 5_000]);
 });
