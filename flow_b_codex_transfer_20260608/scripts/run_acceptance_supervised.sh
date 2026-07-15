@@ -5,12 +5,20 @@ ROOT="${0:A:h:h}"
 RUN_DIR="${1:?RUN_DIR is required}"
 URLS_FILE="${2:?URLS_FILE is required}"
 RESTART_DELAY_SECONDS="${FLOW_B_RESTART_DELAY_SECONDS:-5}"
+STOP_FILE="$RUN_DIR/.stop"
 
 export FLOW_B_RESUME_WINDOW=1
 
 while true; do
+  if [[ -f "$STOP_FILE" ]]; then
+    exit 0
+  fi
   node "$ROOT/scripts/flow_b_playwright.mjs" accept "$RUN_DIR" "$URLS_FILE"
   exit_code=$?
+
+  if [[ -f "$STOP_FILE" ]]; then
+    exit 0
+  fi
 
   if [[ $exit_code -eq 0 ]]; then
     exit 0
