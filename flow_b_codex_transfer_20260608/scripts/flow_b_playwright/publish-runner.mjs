@@ -37,6 +37,29 @@ function rounded(value) {
   return Math.round(Number(value) * 100) / 100;
 }
 
+function importErrorMessages(log) {
+  const messages = [];
+  for (const value of [log?.error_msg, ...(Array.isArray(log?.skus) ? log.skus.map((row) => row?.error_msg) : [])]) {
+    const message = typeof value === "string" ? value : value?.message;
+    if (String(message || "").trim()) messages.push(String(message).trim());
+  }
+  return messages;
+}
+
+function importFailureReason(log) {
+  const evidence = importErrorMessages(log).join(" | ");
+  if (/суточн(?:ый|ого)\s+лимит|исчерпал\S*\s+суточн|daily\s+(?:product\s+)?limit/i.test(evidence)) {
+    return "daily-product-limit";
+  }
+  return "import-failed";
+}
+
+function isEffectiveOnlineProduct(product) {
+  return Number(product?.sku) > 0
+    && String(product?.online_status || "") === "selling"
+    && Number(product?.stock) > 0;
+}
+
 export function prioritizePublishCandidates(items, preflightPureSkus = new Set()) {
   return [...items]
     .map((item, index) => ({
@@ -118,6 +141,9 @@ export function createPublishRunner({
   deadlineAt = null,
   targetConfigCache = null,
   sourceYieldHistoryPath = null,
+  confirmationAttempts = 90,
+  confirmationIntervalMs = 2000,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 } = {}) {
   if (!client || !costBridge || !state) throw new TypeError("client, costBridge, and state are required");
   if (!detailProvider || typeof detailProvider.getProductDetail !== "function") {
@@ -134,6 +160,7 @@ export function createPublishRunner({
   let cnyRubRate = 10.4672;
   let publishChain = Promise.resolve();
   let metricsChain = Promise.resolve();
+  let haltReason = null;
   const adaptive = new AdaptiveConcurrency({ initial: workerCount, max: Math.max(workerCount, Number(maxConcurrency) || workerCount) });
 
   function recordMetric(filename, row) {
@@ -160,8 +187,48 @@ export function createPublishRunner({
     }
   }
 
-  function publishSerial(payload) {
-    const operation = publishChain.then(() => client.publish(payload));
+  async function confirmPublication(sku, payload, targetConfig) {
+    const offerId = payload.rows[0].offer_id;
+    const attempts = Math.max(1, Number(confirmationAttempts) || 1);
+    let lastImportLog = null;
+    let lastOnlineProduct = null;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const importLog = await client.findImportLog({ shopId: targetConfig.store.id, sku, offerId });
+      lastImportLog = importLog || lastImportLog;
+      const status = String(importLog?.import_status || "");
+      if (["all_failed", "failed"].includes(status)) {
+        return { ok: false, reason: importFailureReason(importLog), import_log: importLog };
+      }
+      if (["all_imported", "imported"].includes(status)) {
+        const confirmedOfferId = String(importLog?.offer_id || offerId);
+        const onlineProduct = await client.findOnlineProduct({ shopId: targetConfig.store.id, offerId: confirmedOfferId });
+        lastOnlineProduct = onlineProduct || lastOnlineProduct;
+        if (isEffectiveOnlineProduct(onlineProduct)) return { ok: true, import_log: importLog, online_product: onlineProduct };
+      }
+      if (attempt + 1 < attempts && Number(confirmationIntervalMs) > 0) await sleep(Number(confirmationIntervalMs));
+    }
+    if (lastOnlineProduct) {
+      return {
+        ok: false,
+        reason: "online-product-not-selling",
+        import_log: lastImportLog,
+        online_product: lastOnlineProduct,
+      };
+    }
+    return { ok: false, reason: "publish-final-status-timeout" };
+  }
+
+  function publishSerial(sku, payload, targetConfig) {
+    const operation = publishChain.then(async () => {
+      if (haltReason) return { ok: false, reason: haltReason, not_submitted: true };
+      const publishResult = await client.publish(payload);
+      if (!publishResult?.ok) return { ok: false, reason: "publish-not-confirmed", publish_result: publishResult ?? null };
+      const confirmation = await confirmPublication(sku, payload, targetConfig);
+      if (["daily-product-limit", "online-product-not-selling"].includes(confirmation.reason)) {
+        haltReason = confirmation.reason;
+      }
+      return { ...confirmation, publish_result: publishResult };
+    });
     publishChain = operation.catch(() => {});
     return operation;
   }
@@ -247,11 +314,14 @@ export function createPublishRunner({
       if (profitReason) return skip(item, profitReason, { profit });
 
       const payload = buildPayload(item, detail, economy, targetConfig, now);
-      const publishResult = await timed(sku, "maozi_publish", () => publishSerial(payload));
-      if (!publishResult?.ok) {
-        await state.transition(sku, "failed", { reason: "publish-not-confirmed", publish_result: publishResult ?? null });
-        return { status: "failed", sku, source_url: item.source_url ?? null, reason: "publish-not-confirmed" };
+      const finalResult = await timed(sku, "maozi_publish_and_confirm", () => publishSerial(sku, payload, targetConfig));
+      if (!finalResult?.ok) {
+        const reason = finalResult?.reason || "publish-not-confirmed";
+        await state.transition(sku, "failed", { reason, final_result: finalResult ?? null });
+        return { status: "failed", sku, source_url: item.source_url ?? null, reason };
       }
+
+      const onlineProduct = finalResult.online_product;
 
       await state.recordPublished({
         ...item,
@@ -264,9 +334,16 @@ export function createPublishRunner({
         cate_fee: profit.cate_fee,
         store_id: targetConfig.store.id,
         watermark_id: targetConfig.watermark.id,
+        offer_id: finalResult.import_log?.offer_id || payload.rows[0].offer_id,
+        store_sku: onlineProduct.sku,
+        product_id: onlineProduct.product_id,
+        product_record_id: onlineProduct.id,
+        online_status: onlineProduct.online_status,
+        stock: onlineProduct.stock,
+        import_status: finalResult.import_log?.import_status,
         published_at: now().toISOString(),
       });
-      return { status: "published", sku, source_url: item.source_url ?? null, payload, publishResult };
+      return { status: "published", sku, source_url: item.source_url ?? null, payload, finalResult };
     } catch (error) {
       await state.transition(sku, "failed", { reason: "exception", error: String(error?.message || error) }).catch(() => {});
       return { status: "failed", sku, source_url: item.source_url ?? null, reason: "exception", error };
@@ -311,10 +388,47 @@ export function createPublishRunner({
       }
       if (restoredStatus === "processing" || restoredStatus === "failed") {
         try {
-          const existing = await client.findPublishedSku(sku);
-          if (existing) {
-            await state.recordPublished({ ...item, ...existing, sku, reconciled: true, reconciled_at: now().toISOString() });
+          const importLog = await client.findImportLog({ shopId: targetConfig.store.id, sku });
+          const importStatus = String(importLog?.import_status || "");
+          if (["all_failed", "failed"].includes(importStatus)) {
+            const reason = importFailureReason(importLog);
+            if (reason === "daily-product-limit") haltReason = reason;
+            await state.transition(sku, "failed", { reason, import_log: importLog, reconciled_at: now().toISOString() });
+            return { status: "failed", sku, source_url: item.source_url ?? null, reason };
+          }
+          if (["all_imported", "imported"].includes(importStatus)) {
+            const existing = await client.findOnlineProduct({ shopId: targetConfig.store.id, offerId: importLog.offer_id });
+            if (!existing) {
+              await state.transition(sku, "failed", { reason: "reconciliation-online-product-missing", import_log: importLog });
+              return { status: "failed", sku, reason: "reconciliation-online-product-missing" };
+            }
+            if (!isEffectiveOnlineProduct(existing)) {
+              haltReason = "online-product-not-selling";
+              await state.transition(sku, "failed", {
+                reason: "online-product-not-selling",
+                import_log: importLog,
+                online_product: existing,
+              });
+              return { status: "failed", sku, reason: "online-product-not-selling" };
+            }
+            await state.recordPublished({
+              ...item,
+              sku,
+              offer_id: importLog.offer_id,
+              store_sku: existing.sku,
+              product_id: existing.product_id,
+              product_record_id: existing.id,
+              online_status: existing.online_status,
+              stock: existing.stock,
+              import_status: importStatus,
+              reconciled: true,
+              reconciled_at: now().toISOString(),
+            });
             return { status: "published", sku, source_url: item.source_url ?? null, reconciled: true };
+          }
+          if (importLog) {
+            await state.transition(sku, "failed", { reason: "reconciliation-import-pending", import_log: importLog });
+            return { status: "failed", sku, reason: "reconciliation-import-pending" };
           }
         } catch (error) {
           await state.transition(sku, "failed", { reason: "reconciliation-check-failed", error: String(error?.message || error) }).catch(() => {});
@@ -328,6 +442,7 @@ export function createPublishRunner({
     let cursor = 0;
     while (cursor < candidates.length
       && published < targetCount
+      && !haltReason
       && (!deadlineAt || Date.now() < Date.parse(deadlineAt))
       && (dryLimit === 0 || dryCandidates < dryLimit)) {
       const nearTarget = published >= targetCount - (adaptive.current - 1);
@@ -362,6 +477,7 @@ export function createPublishRunner({
       final_concurrency: adaptive.current,
       deadline_reached: Boolean(deadlineAt && Date.now() >= Date.parse(deadlineAt)),
       target: targetCount,
+      halt_reason: haltReason,
       state_summary: state.summary?.(targetCount),
     };
   }

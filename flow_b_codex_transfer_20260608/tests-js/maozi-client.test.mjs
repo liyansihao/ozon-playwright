@@ -141,6 +141,44 @@ test("client only treats explicit Maozi publish success as success", async () =>
   assert.equal((await badShape.publish({ rows: [] })).ok, false);
 });
 
+test("client verifies the final ERP import log and exact online offer", async () => {
+  const transport = makeTransport({
+    "/api.product.import_logs/index": (path, request) => {
+      assert.deepEqual(request.query, { page: 1, page_size: 10, shop_id: 104965, sku: "3301105092" });
+      return { status: 200, json: { code: 1, data: { data: [
+        { sku: 3301105092, offer_id: "mz-140726-105092", import_status: "all_imported" },
+      ] } } };
+    },
+    "/api.product.online/lists": (path, request) => {
+      assert.deepEqual(request.query, { page: 1, page_size: 10, shop_id: 104965, offer_id: "mz-140726-105092" });
+      return { status: 200, json: { code: 1, data: { data: [
+        { sku: 5069587484, offer_id: "mz-140726-105092", online_status: "ready_to_sell", stock: 0 },
+      ] } } };
+    },
+  });
+  const client = createMaoziClient({ transport });
+  assert.deepEqual(await client.findImportLog({ shopId: 104965, sku: "3301105092" }), {
+    sku: 3301105092, offer_id: "mz-140726-105092", import_status: "all_imported",
+  });
+  assert.deepEqual(await client.findOnlineProduct({ shopId: 104965, offerId: "mz-140726-105092" }), {
+    sku: 5069587484, offer_id: "mz-140726-105092", online_status: "ready_to_sell", stock: 0,
+  });
+});
+
+test("client preserves final import failure evidence", async () => {
+  const failure = {
+    sku: 3761127274,
+    offer_id: "mz-140726-127274",
+    import_status: "all_failed",
+    skus: [{ error_msg: "Не получится загрузить товары: вы исчерпали суточный лимит" }],
+  };
+  const client = createMaoziClient({ transport: async () => ({
+    status: 200,
+    json: { code: 1, data: { data: [failure] } },
+  }) });
+  assert.deepEqual(await client.findImportLog({ shopId: 104965, sku: "3761127274" }), failure);
+});
+
 test("client deletes a favorite through the plugin toggle contract", async () => {
   const transport = makeTransport({
     "/api.product.favorite/toggle": (path, request) => {

@@ -9,6 +9,8 @@ const ENDPOINTS = Object.freeze({
   profit: "/api.tool/calc_profit",
   publish: "/api.selection.follow/import",
   commissions: "/api.config/get_ozon_cate_commission",
+  importLogs: "/api.product.import_logs/index",
+  onlineProducts: "/api.product.online/lists",
 });
 
 function successResponse(response) {
@@ -145,6 +147,27 @@ export function createMaoziClient({ transport }) {
         status: response?.status ?? 0,
         response: response?.json ?? null,
       };
+    },
+
+    async findImportLog({ shopId, sku, offerId } = {}) {
+      const response = await transport(ENDPOINTS.importLogs, {
+        method: "GET",
+        query: { page: 1, page_size: 10, shop_id: shopId, sku: String(sku ?? "") },
+      });
+      const data = requireSuccess(response, "import logs lookup");
+      const rows = listRows(data, "import logs lookup");
+      return rows.find((row) => String(row?.sku) === String(sku)
+        && (!offerId || String(row?.offer_id) === String(offerId))) || null;
+    },
+
+    async findOnlineProduct({ shopId, offerId } = {}) {
+      const response = await transport(ENDPOINTS.onlineProducts, {
+        method: "GET",
+        query: { page: 1, page_size: 10, shop_id: shopId, offer_id: String(offerId ?? "") },
+      });
+      const data = requireSuccess(response, "online product lookup");
+      const rows = listRows(data, "online product lookup");
+      return rows.find((row) => String(row?.offer_id) === String(offerId)) || null;
     },
 
     async deleteFavorite(item) {
