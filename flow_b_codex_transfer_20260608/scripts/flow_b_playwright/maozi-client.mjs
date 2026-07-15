@@ -11,6 +11,7 @@ const ENDPOINTS = Object.freeze({
   commissions: "/api.config/get_ozon_cate_commission",
   importLogs: "/api.product.import_logs/index",
   onlineProducts: "/api.product.online/lists",
+  batchUpdateStock: "/api.product.online/batch_update_stock",
 });
 
 function successResponse(response) {
@@ -168,6 +169,26 @@ export function createMaoziClient({ transport }) {
       const data = requireSuccess(response, "online product lookup");
       const rows = listRows(data, "online product lookup");
       return rows.find((row) => String(row?.offer_id) === String(offerId)) || null;
+    },
+
+    async updateProductStock({ shopId, product, warehouseId, stock = 1 } = {}) {
+      const productId = Number(product?.id);
+      const normalizedWarehouseId = Number(warehouseId);
+      const normalizedStock = Number(stock);
+      if (!(productId > 0)) throw new Error("online product record ID is required for stock update");
+      if (!(normalizedWarehouseId > 0)) throw new Error("verified warehouse ID is required for stock update");
+      if (!Number.isInteger(normalizedStock) || normalizedStock < 0) throw new Error("stock must be a non-negative integer");
+      return requireSuccess(await transport(ENDPOINTS.batchUpdateStock, {
+        method: "POST",
+        body: {
+          shop_id: Number(shopId),
+          products: [{
+            id: productId,
+            offer_id: String(product?.offer_id || ""),
+            warehouses: [{ warehouse_id: normalizedWarehouseId, stock: normalizedStock }],
+          }],
+        },
+      }), "stock update");
     },
 
     async deleteFavorite(item) {

@@ -143,6 +143,8 @@ export function createPublishRunner({
   sourceYieldHistoryPath = null,
   confirmationAttempts = 90,
   confirmationIntervalMs = 2000,
+  warehouseId = null,
+  initialStock = 1,
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 } = {}) {
   if (!client || !costBridge || !state) throw new TypeError("client, costBridge, and state are required");
@@ -157,6 +159,12 @@ export function createPublishRunner({
   if (!Number.isInteger(workerCount) || workerCount <= 0) throw new TypeError("concurrency must be a positive integer");
   const dryLimit = Number(dryCandidateLimit);
   if (!Number.isInteger(dryLimit) || dryLimit < 0) throw new TypeError("dryCandidateLimit must be a non-negative integer");
+  const verifiedWarehouseId = Number(warehouseId);
+  const activationStock = Number(initialStock);
+  if (warehouseId !== null && warehouseId !== undefined && !(verifiedWarehouseId > 0)) {
+    throw new TypeError("warehouseId must be a positive number when configured");
+  }
+  if (!Number.isInteger(activationStock) || activationStock <= 0) throw new TypeError("initialStock must be a positive integer");
   let cnyRubRate = 10.4672;
   let publishChain = Promise.resolve();
   let metricsChain = Promise.resolve();
@@ -192,6 +200,8 @@ export function createPublishRunner({
     const attempts = Math.max(1, Number(confirmationAttempts) || 1);
     let lastImportLog = null;
     let lastOnlineProduct = null;
+    let lastStockUpdate = null;
+    const stockAttempts = new Set();
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       const importLog = await client.findImportLog({ shopId: targetConfig.store.id, sku, offerId });
       lastImportLog = importLog || lastImportLog;
@@ -204,6 +214,31 @@ export function createPublishRunner({
         const onlineProduct = await client.findOnlineProduct({ shopId: targetConfig.store.id, offerId: confirmedOfferId });
         lastOnlineProduct = onlineProduct || lastOnlineProduct;
         if (isEffectiveOnlineProduct(onlineProduct)) return { ok: true, import_log: importLog, online_product: onlineProduct };
+        const stockAttemptKey = String(onlineProduct?.id || confirmedOfferId);
+        if (verifiedWarehouseId > 0
+          && Number(onlineProduct?.sku) > 0
+          && String(onlineProduct?.online_status || "") === "ready_to_sell"
+          && Number(onlineProduct?.stock) <= 0
+          && !stockAttempts.has(stockAttemptKey)) {
+          stockAttempts.add(stockAttemptKey);
+          try {
+            lastStockUpdate = await client.updateProductStock({
+              shopId: targetConfig.store.id,
+              product: onlineProduct,
+              warehouseId: verifiedWarehouseId,
+              stock: activationStock,
+            });
+          } catch (error) {
+            return { ok: false, reason: "stock-activation-failed", import_log: importLog,
+              online_product: onlineProduct, error: String(error?.message || error) };
+          }
+          const updated = Array.isArray(lastStockUpdate?.result)
+            && lastStockUpdate.result.some((row) => row?.updated === true && (!Array.isArray(row?.errors) || row.errors.length === 0));
+          if (!updated) {
+            return { ok: false, reason: "stock-activation-rejected", import_log: importLog,
+              online_product: onlineProduct, stock_update: lastStockUpdate };
+          }
+        }
       }
       if (attempt + 1 < attempts && Number(confirmationIntervalMs) > 0) await sleep(Number(confirmationIntervalMs));
     }
@@ -213,6 +248,7 @@ export function createPublishRunner({
         reason: "online-product-not-selling",
         import_log: lastImportLog,
         online_product: lastOnlineProduct,
+        stock_update: lastStockUpdate,
       };
     }
     return { ok: false, reason: "publish-final-status-timeout" };

@@ -131,6 +131,29 @@ test("client validates endpoint request shapes for category and profit lookups",
   );
 });
 
+test("client updates one imported product in the verified FBS warehouse", async () => {
+  const transport = makeTransport({
+    "/api.product.online/batch_update_stock": {
+      status: 200,
+      json: { code: 1, data: { updated_count: 1, result: [{ updated: true, errors: [] }] } },
+    },
+  });
+  const client = createMaoziClient({ transport });
+  assert.deepEqual(await client.updateProductStock({
+    shopId: 104965,
+    product: { id: 1270954452, offer_id: "mz-140726-091839" },
+    warehouseId: 1020005022957960,
+    stock: 1,
+  }), { updated_count: 1, result: [{ updated: true, errors: [] }] });
+  assert.deepEqual(transport.calls, [[
+    "/api.product.online/batch_update_stock",
+    { method: "POST", body: {
+      shop_id: 104965,
+      products: [{ id: 1270954452, offer_id: "mz-140726-091839", warehouses: [{ warehouse_id: 1020005022957960, stock: 1 }] }],
+    } },
+  ]]);
+});
+
 test("client only treats explicit Maozi publish success as success", async () => {
   const ok = createMaoziClient({ transport: async () => ({ status: 200, json: { code: 1, msg: "success" } }) });
   const badCode = createMaoziClient({ transport: async () => ({ status: 200, json: { code: 0, msg: "failed" } }) });

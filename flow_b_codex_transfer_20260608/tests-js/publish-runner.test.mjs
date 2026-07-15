@@ -141,6 +141,46 @@ test("runner does not count a final import that is only ready to sell with zero 
   assert.ok(state.transitions.some((event) => event.status === "failed" && event.data.reason === "online-product-not-selling"));
 });
 
+test("runner activates a ready-to-sell product in the verified FBS warehouse before counting it", async () => {
+  const state = fakeState();
+  const stockUpdates = [];
+  let onlineChecks = 0;
+  const client = clientFor([{ id: 92, sku: 3301105092 }], {
+    findImportLog: async ({ sku, offerId }) => ({ sku, offer_id: offerId, import_status: "all_imported" }),
+    findOnlineProduct: async ({ offerId }) => {
+      onlineChecks += 1;
+      return {
+        id: 1271192336,
+        product_id: 5489750001,
+        sku: 5069587484,
+        offer_id: offerId,
+        online_status: onlineChecks === 1 ? "ready_to_sell" : "selling",
+        stock: onlineChecks === 1 ? 0 : 1,
+      };
+    },
+    updateProductStock: async (input) => {
+      stockUpdates.push(input);
+      return { updated_count: 1, result: [{ updated: true, errors: [] }] };
+    },
+  });
+  const result = await createPublishRunner({
+    client,
+    costBridge: { estimate: async () => ({ ok: true, cost: 20 }) },
+    state,
+    target: 1,
+    warehouseId: 1020005022957960,
+    initialStock: 1,
+    confirmationAttempts: 2,
+    confirmationIntervalMs: 0,
+  }).run();
+
+  assert.equal(result.published, 1);
+  assert.equal(state.records[0].online_status, "selling");
+  assert.equal(state.records[0].stock, 1);
+  assert.equal(stockUpdates.length, 1);
+  assert.equal(stockUpdates[0].warehouseId, 1020005022957960);
+});
+
 test("runner counts only a final imported task that is selling with positive stock", async () => {
   const state = fakeState();
   const client = clientFor([{ id: 92, sku: 3301105092 }], {

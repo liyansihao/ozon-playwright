@@ -120,6 +120,8 @@ async function createPublishingSession(context, options, env, shared) {
       deadlineAt: env.FLOW_B_DEADLINE_AT || null,
       targetConfigCache: shared.targetConfigCache || null,
       sourceYieldHistoryPath: env.FLOW_B_SOURCE_YIELD_HISTORY || path.join(ROOT, "data/flow_b/source_yield_history.jsonl"),
+      warehouseId: env.FLOW_B_WAREHOUSE_ID || null,
+      initialStock: Math.max(1, Number(env.FLOW_B_INITIAL_STOCK) || 1),
     });
     return { maoziPage, costBridge, detailProvider, runner };
   } catch (error) {
@@ -308,6 +310,8 @@ async function runAcceptance(context, options, env) {
     acceptance_target: acceptanceTarget,
     store_id: Number(env.FLOW_B_STORE_ID || 104965),
     watermark_id: Number(env.FLOW_B_WATERMARK_ID || 60822),
+    warehouse_id: env.FLOW_B_WAREHOUSE_ID ? Number(env.FLOW_B_WAREHOUSE_ID) : null,
+    initial_stock: Math.max(1, Number(env.FLOW_B_INITIAL_STOCK) || 1),
     initial_concurrency: Number(env.FLOW_B_PUBLISH_WORKERS || 8),
     max_concurrency: Number(env.FLOW_B_MAX_PUBLISH_WORKERS || 12),
   });
