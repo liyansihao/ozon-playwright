@@ -15,7 +15,9 @@
     "test": "npm run test:flow-b && npm run test:python && npm run test:stable-core",
     "test:stable-core": "node --test test/stable-core.test.mjs",
     "app:init": "node src/cli/ozon-app.mjs init",
-    "app:status": "node src/cli/ozon-app.mjs status"
+    "app:status": "node src/cli/ozon-app.mjs status",
+    "app:demo": "node src/cli/run-demo.mjs",
+    "package:release": "node scripts/package-release.mjs"
   },
   "dependencies": {
     "playwright": "^1.54.0"
