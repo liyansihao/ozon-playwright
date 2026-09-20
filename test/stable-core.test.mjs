@@ -48,3 +48,17 @@ test("task store refuses illegal state changes", async () => {
   await store.upsert({ task_id: "t", stage: "review", state: "ready" });
   await assert.rejects(() => store.upsert({ task_id: "t", stage: "review", state: "succeeded" }), /invalid task transition/);
 });
+
+import { createFlowHubPolicyReviewAdapter, evaluateFlowHubIdentity } from "../src/adapters/flowhub-review-policy.mjs";
+
+test("FlowHub review policy blocks hard brand and model conflicts", () => {
+  assert.deepEqual(evaluateFlowHubIdentity({ dinoScore: 0.95, qwenVerdict: "match", brandOrModelConflict: true }), { outcome: "rejected", reason_codes: ["brand_or_model_conflict"] });
+});
+
+test("FlowHub review policy sends uncertain evidence to a human", async () => {
+  assert.equal(evaluateFlowHubIdentity({ dinoScore: 0.75, qwenVerdict: "match" }).outcome, "manual_review");
+  const adapter = createFlowHubPolicyReviewAdapter({ now: () => new Date("2026-09-20T00:00:00Z") });
+  const decision = await adapter.review({ ...candidate, facts: { identity: { dinoScore: 0.75, qwenVerdict: "match" } } });
+  assert.equal(decision.outcome, "manual_review");
+  assert.equal(decision.policy_version, "flowhub-review-policy-v1");
+});

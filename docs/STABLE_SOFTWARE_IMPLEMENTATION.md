@@ -9,6 +9,7 @@
 - `src/contracts/review.mjs`：FlowHub 审核输出的 ReviewDecision 校验。
 - `src/adapters/flowhub-seed-adapter.mjs`：只读种子适配器，只返回候选和游标。
 - `src/adapters/flowhub-review-adapter.mjs`：审核适配器，不拥有发布权限。
+- `src/adapters/flowhub-review-policy.mjs`：FlowHub 同款判断规则的可测试纯函数版本。
 - `src/core/task-store.mjs`：原子 JSON 持久化、任务状态转换、租约和事件记录。
 - `src/app/orchestrator.mjs`：来源、审核、发布三个阶段的独立推进和错误隔离。
 - `src/cli/ozon-app.mjs`：独立数据目录初始化和状态查看命令。
@@ -22,7 +23,7 @@ npm run app:init -- ./data-dev
 npm run app:status -- ./data-dev
 ```
 
-真实来源、真实审核和真实发布必须在适配器中注入。当前测试使用假数据，不会访问 Ozon、ERP、1688 或生产 FlowHub。
+当前审核规则已经可以使用脱敏身份证据本地运行；真实来源、真实审核服务和真实发布仍必须在适配器中注入。当前测试使用假数据，不会访问 Ozon、ERP、1688 或生产 FlowHub。
 
 ## 接入 FlowHub 的规则
 
