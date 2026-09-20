@@ -22,3 +22,6 @@ tmp/
 *.log
 *.jsonl
 *.csv
+
+# local development data
+data-dev/
