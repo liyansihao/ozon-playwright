@@ -106,3 +106,25 @@ npm test
 - 仓库不包含插件文件、浏览器配置、Cookie、访问令牌、运行日志或商品数据。
 - `publish` 和 `run` 会产生真实上架操作；首次使用请先运行 `verify`，再用小目标测试。
 - 利润结果依赖 Ozon 页面信息、1688 搜索匹配和 MaoziERP 计算结果，正式批量运行前应人工抽查。
+
+## Stable software foundation
+
+The stable-software implementation starts from `agent/sustain-ozon-publishing @ b4933911e53721839c585fb9c423208712f5e404`.
+The first foundation is in `src/` and is deliberately separated from the legacy Flow B scripts:
+
+- `src/contracts/` validates FlowHub seed and review data without importing FlowHub.
+- `src/core/task-store.mjs` persists stage state, leases and recovery events.
+- `src/adapters/` contains the only FlowHub integration boundary.
+- `src/app/orchestrator.mjs` advances source, review and publish stages independently.
+- `docs/STABLE_SOFTWARE_IMPLEMENTATION.md` explains the first implementation slice.
+
+Run the foundation locally with test data:
+
+```sh
+npm install
+npm run test
+npm run app:init -- ./data-dev
+npm run app:status -- ./data-dev
+```
+
+This does not start a publisher or connect to a production account. Real credentials and production data must be supplied through a later, reviewed adapter.
